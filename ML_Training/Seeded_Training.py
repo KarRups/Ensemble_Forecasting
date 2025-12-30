@@ -22,6 +22,7 @@ functions_path = Path("/home/mokr/Loss_Functions_Paper/ML_Functions/")
 sys.path.append(str(functions_path))
 
 import ML_functions
+import ML_Models
 import ML_Losses
 from ML_functions import HydroDataset, CRPSLoss_Ensemble, train_seeded_model, Discrete_CRPSLoss #, load_dataloaders
 
@@ -79,11 +80,13 @@ def run_hyperparameter_test():
     
     # Define hyperparameter grid
     learning_rates = [1e-3] 
-    bidirectional = False #[False, True]
+    bidirectional = False
+    num_layers = [1,2]
     hidden_sizes = [      
         (256, 256, 128),
     ]
     num_ensemble_members_list = [16] 
+    
 
     gammas = [0.3]
     fixed_noises = [True, False]
@@ -124,7 +127,7 @@ def run_hyperparameter_test():
                             sys.stdout.flush()
                             
                             # Initialize model
-                            model = ML_functions.Google_Model_Block(
+                            model = ML_Models.Google_Model_Block(
                                 hindcast_input_size, forecast_input_size,
                                 hindcast_output_size, forecast_output_size,
                                 hindcast_hidden_size, forecast_hidden_size, handoff_hidden_size,
@@ -141,7 +144,7 @@ def run_hyperparameter_test():
                             print('Starting training...')
                             sys.stdout.flush()
                             
-                            train_seeded_model(model, optimizer, Training_Dataloader, epochs=2, batch_accumulation_size=batch_accumulation, 
+                            train_seeded_model(model, optimizer, Training_Dataloader, epochs=5, batch_accumulation_size=batch_accumulation, 
                                           num_ensemble_members=num_ensemble_members, noise_scale= noise_scale,
                                           criterion = criterion, scheduler = scheduler, train_mode = True, fixed_noise = fixed_noise)
                             print('Training complete.')
@@ -161,7 +164,7 @@ def run_hyperparameter_test():
         
         
                             
-                            train_seeded_model(model, optimizer, Training_Dataloader, epochs=3, batch_accumulation_size=batch_accumulation, 
+                            train_seeded_model(model, optimizer, Training_Dataloader, epochs=5, batch_accumulation_size=batch_accumulation, 
                                           num_ensemble_members=num_ensemble_members, noise_scale=noise_scale,
                                           criterion= criterion, scheduler = scheduler, train_mode = True, fixed_noise = fixed_noise)
                             print('Training complete.')
@@ -179,7 +182,7 @@ def run_hyperparameter_test():
                                           criterion=None, scheduler = None, train_mode = False, fixed_noise = fixed_noise)
         
         
-                            # train_seeded_model(model, optimizer, Training_Dataloader, epochs=5, batch_accumulation_size=batch_accumulation, 
+                            # train_seeded_model(model, optimizer, Training_Dataloader, epochs=15, batch_accumulation_size=batch_accumulation, 
                             #               num_ensemble_members= num_ensemble_members, noise_scale=noise_scale,
                             #               criterion= criterion, scheduler = scheduler, train_mode = True, fixed_noise = fixed_noise)
                             
@@ -188,7 +191,7 @@ def run_hyperparameter_test():
         
         
                             # # Save model
-                            # model_path = os.path.join(model_dir, f"Seeded_{config_desc}_{timestamp}_{num_ensemble_members}__{gamma}_15_{fixed_noise}_Epochs.pth")
+                            # model_path = os.path.join(model_dir, f"Seeded_{config_desc}_{timestamp}_{num_ensemble_members}__{gamma}_25_{fixed_noise}_Epochs.pth")
                             # torch.save(model, model_path)
                             # print(f"Model saved to {model_path}")
         

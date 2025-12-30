@@ -1,63 +1,44 @@
+"""
+FILE CONTENTS
+================================================================================
 
+CLASSES:
+--------------------------------------------------------------------------------
+ 1. Multi_Basins_HF_LSTMDataGenerator
+    No description available
+    Methods: __init__, __len__, __getitem__
 
+ 2. Multi_Basin_LSTMDataGenerator
+    No description available
+    Methods: __init__, __len__, __getitem__
 
-def plot_predictions_vs_observations(model, dataloader, num_samples=365):
-    model.eval()  # Set model to evaluation mode
-    predictions = []
-    observations = []
-    
-    with torch.no_grad():
-        for i, (x, y) in enumerate(dataloader):
-            if i >= num_samples:
-                break
-                
-            # Get prediction
-            pred = model(x)
-            
-            # Store prediction and observation
-            predictions.append(pred.squeeze().cpu().numpy())
-            observations.append(y.squeeze().cpu().numpy())
-    
-    # Convert to numpy arrays
-    predictions = np.array(predictions)
-    observations = np.array(observations)
-    
-    # Create time index
-    time_index = np.arange(len(predictions))
-    
-    # Create the plot
-    plt.figure(figsize=(15, 6))
-    plt.plot(time_index, observations, label='Observations', color='blue', alpha=0.7)
-    plt.plot(time_index, predictions, label='Predictions', color='red', alpha=0.7)
-    
-    # Add bands for prediction uncertainty if available
-    # plt.fill_between(time_index, predictions - std, predictions + std, 
-    #                 color='red', alpha=0.2, label='Prediction Uncertainty')
-    
-    plt.xlabel('Time Steps')
-    plt.ylabel('Value')
-    plt.title('River Discharge Predictions vs Observations')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    # Calculate metrics
-    # Nash-Sutcliffe Efficiency (NSE)
-    nse = 1 - (np.sum((observations - predictions) ** 2) / 
-               np.sum((observations - np.mean(observations)) ** 2))
-    
-    # Kling-Gupta Efficiency (KGE)
-    kge = calculate_kge(observations, predictions)
-    
-    # R-squared (R²)
-    r2 = np.corrcoef(observations, predictions)[0, 1]**2
-    
-    print(f'NSE: {nse:.4f}')
-    print(f'KGE: {kge:.4f}')
-    print(f'R²: {r2:.4f}')
-    plt.show()
-    
-    return predictions, observations
+ 3. HF_LSTMDataGenerator
+    No description available
+    Methods: __init__, __len__, __getitem__
 
+ 4. LSTMDataGenerator
+    No description available
+    Methods: __init__, __len__, __getitem__
+
+FUNCTIONS:
+--------------------------------------------------------------------------------
+ 1. check_streamflow_data
+    Check CSV files for NaN values in streamflow between specified dates. This me...
+ 2. check_streamflow_data_recursively
+    Recursively check CSV files in all subdirectories for NaN values in streamflo...
+ 3. create_dataloaders
+    No description available
+ 4. plot_predictions_vs_observations
+    No description available
+ 5. process_ensemble_predictions
+    Process ensemble predictions for evaluation metrics in a versatile way.
+================================================================================
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import glob
 
 class Multi_Basins_HF_LSTMDataGenerator(Dataset):
     def __init__(self, valid_start_dates, ERA5_Land, HRES, Static_df, Discharge, scalers, basin_indices, Hind_variables, Fore_variables, history_sequence_length, forecast_sequence_length):
@@ -201,10 +182,6 @@ class Multi_Basins_HF_LSTMDataGenerator(Dataset):
         return Hist_X_Chunk_Torch, Fore_X_Chunk_Torch, Y_value, str(end_prediction_date), basin_idx
 
 
-
-
-
-
 class Multi_Basin_LSTMDataGenerator(Dataset):
     def __init__(self, valid_start_dates, ERA5_Land, Caravans, Discharge, basin_indices, variables, sequence_length=90):
         """
@@ -276,7 +253,6 @@ class Multi_Basin_LSTMDataGenerator(Dataset):
         Y_value = torch.tensor(self.Discharge[start_prediction_date : end_prediction_date]).float()
 
         return Hist_X_Chunk_Torch, Y_value, str(end_prediction_date), basin_idx
-
 
 
 class HF_LSTMDataGenerator(Dataset):
@@ -395,6 +371,100 @@ class LSTMDataGenerator(Dataset):
         return X_Chunk_Torch, Y_value
 
 
+def check_streamflow_data(directory_path, start_date, end_date):
+    """
+    Check CSV files for NaN values in streamflow between specified dates. This means all the basins have entries in these dates, which means we can randomly chose date-basin combinations in training 
+    
+    Args:
+        directory_path (str): Path to directory containing CSV files
+        start_date (str): Start date in format 'YYYY-MM-DD'
+        end_date (str): End date in format 'YYYY-MM-DD'
+    
+    Returns:
+        tuple: (valid_files, invalid_files) where each is a list of filenames
+    """
+    # Get all CSV files in the directory
+    csv_files = glob.glob(os.path.join(directory_path, "*.csv"))
+    
+    valid_files = []
+    invalid_files = []
+    
+    for file_path in csv_files:
+        try:
+            # Read the CSV file
+            # print(file_path)
+            df = pd.read_csv(file_path, parse_dates=['date'])
+            
+            # Filter for date range
+            mask = (df['date'] >= start_date) & (df['date'] <= end_date)
+            df_filtered = df.loc[mask]
+            filename = os.path.splitext(os.path.basename(file_path))[0]
+            # Check for NaN values in streamflow column
+            if df_filtered['streamflow'].isna().any():
+                invalid_files.append(os.path.basename(filename))
+            else:
+                valid_files.append(os.path.basename(filename))
+                # print("found one!")
+                
+        except Exception as e:
+            print(f"Error processing {file_path}: {str(e)}")
+            filename = os.path.splitext(os.path.basename(file_path))[0]
+            invalid_files.append(os.path.basename(filename))
+    
+    return valid_files, invalid_files
+
+
+def check_streamflow_data_recursively(directory_path, start_date, end_date): # Takes about 25 seconds to process 100 stations, 
+    """
+    Recursively check CSV files in all subdirectories for NaN values in streamflow between specified dates.
+    
+    Args:
+        directory_path (str): Path to root directory containing CSV files and subdirectories
+        start_date (str): Start date in format 'YYYY-MM-DD'
+        end_date (str): End date in format 'YYYY-MM-DD'
+    
+    Returns:
+        tuple: (valid_files, invalid_files) where each is a list of filenames with relative paths
+    """
+    valid_files = []
+    invalid_files = []
+    
+    # Walk through all subdirectories
+    for root, dirs, files in os.walk(directory_path):
+        counter = 0
+        for file in files:
+            if file.endswith('.csv'):
+                counter += 1
+                if counter % 1000 == 0:
+                    print("1000 stations processed")
+                file_path = os.path.join(root, file)
+                try:
+                    # Read the CSV file
+                    df = pd.read_csv(file_path, parse_dates=['date'])
+                    
+                    # Filter for date range
+                    mask = (df['date'] >= start_date) & (df['date'] <= end_date)
+                    df_filtered = df.loc[mask]
+                    
+                    # Get relative path from the root directory
+                    relative_path = os.path.relpath(file_path, directory_path)
+                    filename = os.path.splitext(relative_path)[0]
+                    
+                    # Check for NaN values in streamflow column
+                    if df_filtered['streamflow'].isna().any():
+                        invalid_files.append(filename)
+                    else:
+                        valid_files.append(filename)
+                        # print("found a suitable basin")
+                    
+                except Exception as e:
+                    print(f"Error processing {file_path}: {str(e)}")
+                    relative_path = os.path.relpath(file_path, directory_path)
+                    filename = os.path.splitext(relative_path)[0]
+                    invalid_files.append(filename)
+    
+    return valid_files, invalid_files
+
 
 def create_dataloaders(ERA5_Land, HRES, Static_df, Discharge, scalers, train_basins, val_basins, ML_functions):
     batch_size = 2 #128
@@ -460,3 +530,119 @@ def create_dataloaders(ERA5_Land, HRES, Static_df, Discharge, scalers, train_bas
 
     return Training_Dataloader, Validation_Dataloader
 
+
+def plot_predictions_vs_observations(model, dataloader, num_samples=365):
+    model.eval()  # Set model to evaluation mode
+    predictions = []
+    observations = []
+    
+    with torch.no_grad():
+        for i, (x, y) in enumerate(dataloader):
+            if i >= num_samples:
+                break
+                
+            # Get prediction
+            pred = model(x)
+            
+            # Store prediction and observation
+            predictions.append(pred.squeeze().cpu().numpy())
+            observations.append(y.squeeze().cpu().numpy())
+    
+    # Convert to numpy arrays
+    predictions = np.array(predictions)
+    observations = np.array(observations)
+    
+    # Create time index
+    time_index = np.arange(len(predictions))
+    
+    # Create the plot
+    plt.figure(figsize=(15, 6))
+    plt.plot(time_index, observations, label='Observations', color='blue', alpha=0.7)
+    plt.plot(time_index, predictions, label='Predictions', color='red', alpha=0.7)
+    
+    # Add bands for prediction uncertainty if available
+    # plt.fill_between(time_index, predictions - std, predictions + std, 
+    #                 color='red', alpha=0.2, label='Prediction Uncertainty')
+    
+    plt.xlabel('Time Steps')
+    plt.ylabel('Value')
+    plt.title('River Discharge Predictions vs Observations')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Calculate metrics
+    # Nash-Sutcliffe Efficiency (NSE)
+    nse = 1 - (np.sum((observations - predictions) ** 2) / 
+               np.sum((observations - np.mean(observations)) ** 2))
+    
+    # Kling-Gupta Efficiency (KGE)
+    kge = calculate_kge(observations, predictions)
+    
+    # R-squared (R²)
+    r2 = np.corrcoef(observations, predictions)[0, 1]**2
+    
+    print(f'NSE: {nse:.4f}')
+    print(f'KGE: {kge:.4f}')
+    print(f'R²: {r2:.4f}')
+    plt.show()
+    
+    return predictions, observations
+
+
+def process_ensemble_predictions(model_predictions, true_discharge, basin_idx,
+                               ensemble_summaries, crps_per_leadtime, variogram_scores, stored_forecasts,
+                               NSE_scores, KGE_scores, basin_forecasts, variogram_p = 0.5):
+    """
+    Process ensemble predictions for evaluation metrics in a versatile way.
+    
+    Args:
+        model_predictions: Dictionary with model names as keys and prediction tensors as values
+                          e.g., {"CRPS": tensor, "NLL": tensor, "Fixed_Seeded": tensor, ...}
+        true_discharge: Ground truth discharge values
+        basin_idx: Basin index or list of basin indices
+        ensemble_summaries, crps_per_leadtime, etc.: Output dictionaries
+    """
+    
+    # Process each model's predictions
+    for model_name, predictions in model_predictions.items():
+        if model_name == "Discharge":  # Skip if discharge is accidentally passed as a model
+            continue
+            
+        # Ensemble summaries
+        if model_name in ensemble_summaries:
+            ensemble_summaries[model_name].append(get_member_summaries_torch(predictions))
+
+        
+        # CRPS per leadtime
+        if model_name in crps_per_leadtime:
+            crps_per_leadtime[model_name].append(compute_crps(predictions, true_discharge))
+            variogram_scores[model_name].append(variogram_score_torch(predictions, true_discharge, variogram_p))
+        
+        # Stored forecasts
+        if model_name in stored_forecasts:
+            stored_forecasts[model_name].append(predictions)
+        
+        # NSE scores
+        if model_name in NSE_scores:
+            NSE_scores[model_name].append(calculate_nse(true_discharge.squeeze(), predictions.squeeze()[0]))
+        
+        # KGE scores
+        if model_name in KGE_scores:
+            KGE_scores[model_name].append(calculate_kge(true_discharge.squeeze(), predictions.squeeze()[0]))
+        
+        # Basin forecasts
+        if basin_idx in basin_forecasts and model_name in basin_forecasts[basin_idx]:
+            basin_forecasts[basin_idx][model_name].append(predictions[:, 0, :])
+    
+    # Handle discharge (ground truth) separately
+    if "Discharge" in ensemble_summaries:
+        ensemble_summaries["Discharge"].append(get_member_summaries_torch(true_discharge.unsqueeze(0)))
+    
+    if "Discharge" in stored_forecasts:
+        stored_forecasts["Discharge"].append(true_discharge)
+    
+    if basin_idx in basin_forecasts and "Discharge" in basin_forecasts[basin_idx]:
+        basin_forecasts[basin_idx]["Discharge"].append(true_discharge[0, :])
+
+
+v

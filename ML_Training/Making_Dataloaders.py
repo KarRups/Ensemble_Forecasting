@@ -31,7 +31,7 @@ ERA5_Land = xr.open_zarr(store=ERA5_zarr_path, chunks= None)
 HRES = xr.open_zarr(store=HRES_zarr_path, chunks= None)
 
 
-with open("/home/mokr/Loss_Functions_Paper/Catchment_Averaging/ML_basin_splits.pkl", "rb") as f:
+with open("/home/mokr/Loss_Functions_Paper/ML_basin_splits.pkl", "rb") as f:
     basin_splits = pickle.load(f)
 
 train_basins, val_basins, test_basins = basin_splits['train'], basin_splits['val'], basin_splits['test']

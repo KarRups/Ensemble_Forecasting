@@ -1,37 +1,85 @@
+"""
+FILE CONTENTS
+================================================================================
+
+CLASSES:
+--------------------------------------------------------------------------------
+ 1. HydroDataset
+    No description available
+    Methods: __init__, __len__, __getitem__
+    
+ 2. Multi_Basins_HF_LSTMDataGenerator
+    No description available
+    Methods: __init__, __len__, __getitem__
+ 3. Multi_Basins_HF_LSTMDataGenerator_Binary
+    No description available
+    Methods: __init__, __len__, __getitem__
+
+4. CRPSLoss_Ensemble
+    Continuous Ranked Probability Score (CRPS) implemented as a PyTorch loss func...
+    Methods: __init__, smooth_heaviside, forward
+5. Discrete_CRPSLoss
+    Continuous Ranked Probability Score (CRPS) implemented as a PyTorch loss func...
+    Methods: __init__, forward
+
+FUNCTIONS:
+--------------------------------------------------------------------------------
+ 1. load_scalers
+    Load saved scalers
+ 2. load_dataloaders
+    No description available
+ 3. process_era5_land_data
+    Selects, converts, and scales ERA5 Land data in a single function.
+ 4. process_hres_data
+    Selects, converts, and scales HRES forecast data in a single function.
+ 5. prepare_masked_discharge
+    Prepare masked discharge with probabilistic masking.
+    
+    No description available
+ 7. train_model
+    Training function for PyTorch model with gradient accumulation.
+ 8. train_model_CMAL
+    Training function for PyTorch model with gradient accumulation.
+ 9. train_seeded_model
+    Train a model using ensemble predictions and batch accumulation.
+    
+10. run_ensemble_predictions
+    Run model predictions with an additional row of random noise each time.
+11. calculate_kge
+    Calculate Kling-Gupta Efficiency for timeseries data.
+12. calculate_crps
+    Computes CRPS from x using y as reference,
+13. transform_CMAL_parameters
+    Transform a tensor by applying:
+14. transform_CMAL_parameters_multi
+    Generates predictions from a tensor representing multiple Asymetric Laplacians
+15. load_and_unnormalize
+    Load scaler and normalize ensemble predictions and true discharge.
+16. replace_keys
+    Replace keys in a dictionary according to key_map.
+17. print_cuda_memory_summary
+    No description available
+================================================================================
+"""
+
 import time
 import itertools
 import joblib
 import sys
 import gc
-
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import defaultdict
 from torch.utils.data import Dataset
-
 import warnings
-
 import sys
 from pathlib import Path
-functions_path = Path("/home/mokr/Loss_Functions_Paper/ML_Functions/")
-sys.path.append(str(functions_path))
-
-# from ML_Plots import generate_greedy_trajectories, get_ensemble_members_vectorized
 from ML_Losses import get_member_summaries, compute_crps, get_member_summaries_torch
 
-# At the top of your script or just before the line causing the warning
-warnings.filterwarnings('ignore', category=FutureWarning, message='Series.__getitem__ treating keys as positions is deprecated')
-
-
-def load_scalers(output_path = 'scalers'):
-    """Load saved scalers"""
-    scalers = joblib.load(f'{output_path}.joblib')
-    return scalers
-
+functions_path = Path("/home/mokr/Loss_Functions_Paper/ML_Functions/")
 
 class HydroDataset(Dataset):
     def __init__(self, data_list):
@@ -43,171 +91,6 @@ class HydroDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]  # Returns the tuple of 5 elements at position idx
 
-## Making models
-
-class NN(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(NN, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, output_size)
-        self.output_size = output_size  # Store output_size for slicing
-
-
-    def forward(self, x):
-        # x has shape [num_layers, batch_size, input_size]
-        x = self.fc1(x)
-        x = F.relu(x)
-        x = self.fc2(x)
-
-        # Split along the last dimension
-        split_size = self.output_size // 2  # Ensure even split
-        hn_new, cn_new = x[..., :split_size], x[..., split_size:]
-
-        return hn_new, cn_new
-        
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0, bidirectional=False, Sequence_Target=False):
-        super(LSTMModel, self).__init__()
-        self.bidirectional = bidirectional
-        self.No_Directions = 2 if bidirectional else 1
-        self.Sequence_Target = Sequence_Target
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
-                             batch_first=True, 
-                             dropout=dropout, 
-                             bidirectional=bidirectional)
-        self.dropout = nn.Dropout(p=dropout)
-        self.fc = nn.Linear(hidden_size * self.No_Directions, output_size)
-    def forward(self, x):
-        # Correct initialization of hidden state for batched input
-        batch_size = x.size(0)
-        h0 = torch.zeros(self.num_layers * self.No_Directions, batch_size, self.hidden_size).to(x.device)
-        c0 = torch.zeros(self.num_layers * self.No_Directions, batch_size, self.hidden_size).to(x.device)
-        
-        # Pass initial states to LSTM
-        out, _ = self.lstm(x, (h0, c0))
-        
-        # Apply dropout
-        out = self.dropout(out)
-        
-        # Handle sequence target or last time step
-        if not self.Sequence_Target:
-            # Take the last time step for each sequence in the batch
-            out = out[:, -1, :]  # Shape: [batch_size, hidden_size * No_Directions]
-        
-        # Final linear layer
-        out = self.fc(out)
-        return out
-
-class Hindcast_LSTM_Block(nn.Module):
-    # This block serves to take in historic data and output the initial memory and hidden 
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout = 0.0, bidirectional = False, eval_dropout = True):
-        super(Hindcast_LSTM_Block, self).__init__()
-        self.bidirectional = bidirectional  # Store bidirectional as an instance variable
-        self.No_Directions = 1 if not bidirectional else 2
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-
-        self.dropout = dropout
-        self.eval_dropout = eval_dropout
-        
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout= dropout, bidirectional = bidirectional)
-        # self.dropout = nn.Dropout(p=dropout)
-        self.fc = nn.Linear(hidden_size * self.No_Directions, output_size) # If bidirectional is true need the *2
-
-    def forward(self, x):
-        # Map H0_sequences and H0_static to the appropriate sizes
-        # Is this implementation of history doing anything
-        
-        # h0 = torch.zeros(self.num_layers * self.No_Directions, self.hidden_size).to(x.device)
-        # c0 = torch.zeros(self.num_layers * self.No_Directions, self.hidden_size).to(x.device)
-
-        if len(np.shape(x)) == 3:
-            h0 = torch.zeros( self.num_layers * self.No_Directions, x.size(0), self.hidden_size).to(x.device)
-            c0 = torch.zeros( self.num_layers * self.No_Directions, x.size(0), self.hidden_size).to(x.device)
-        else:
-            h0 = torch.zeros( self.num_layers * self.No_Directions, self.hidden_size).to(x.device)
-            c0 = torch.zeros(self.num_layers * self.No_Directions, self.hidden_size).to(x.device)
-            
-        out, (hn, cn) = self.lstm(x, (h0.contiguous(), c0.contiguous())) 
-        # out = self.dropout(out)
-        out = F.dropout(out, p= self.dropout, training= self.eval_dropout)
-        out = self.fc(out)  # Take the output from the last time step
-        return out, hn, cn
-
-class Forecast_LSTM_Block(nn.Module):
-    # This block serves to take in historic data and output the initial memory and hidden 
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout = 0.0, bidirectional = False, eval_dropout = True):
-        super(Forecast_LSTM_Block, self).__init__()
-        self.bidirectional = bidirectional  # Store bidirectional as an instance variable
-        self.No_Directions = 1 if not bidirectional else 2
-
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-
-        self.dropout = dropout
-        self.eval_dropout = eval_dropout
-
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout= dropout, bidirectional = bidirectional)
-        # self.dropout = nn.Dropout(p=dropout)
-        self.fc = nn.Linear(hidden_size * self.No_Directions, output_size) # If bidirectional is true need the *2
-
-    def forward(self, x, h0, c0):
-        # Map H0_sequences and H0_static to the appropriate sizes
-        # Is this implementation of history doing anything
-   
-        out, _ = self.lstm(x, (h0.contiguous(), c0.contiguous())) 
-        # out = self.dropout(out)
-        out = F.dropout(out, p= self.dropout, training= self.eval_dropout)
-        out = self.fc(out)  # Take the output from the last time step
-        return out
-        
-class Google_LSTMModel(nn.Module):
-  def __init__(self, hindcast, forecast, handover):
-    super(Google_LSTMModel, self).__init__()
-    self.hindcast = hindcast
-    self.forecast = forecast
-    self.handover = handover
-      
-  def forward(self, history, forecasts):
-    
-    # get states from hindcast model
-    # need to decide whether the head recieves the raw history or an encoding of it
-    hind_out, hn,cn = self.hindcast(history)
-    # add a neural network to convert one states fro history to an initialisation for forecasts
-    hn_new, cn_new = self.handover(torch.cat((hn, cn), dim=-1))
-    # get forecasts from forecast model
-
-    # Ensure contiguity and correct shape for LSTM input
-    hn_new = hn_new.contiguous()
-    cn_new = cn_new.contiguous()
-      
-    out = self.forecast(forecasts, hn_new,cn_new)
-    return hind_out , out
-
-def Google_Model_Block(hindcast_input_size, forecast_input_size, hindcast_output_size, forecast_output_size, hindcast_hidden_size, forecast_hidden_size, handoff_hidden_size, num_layers, device, dropout = 0.0, bidirectional = False, eval_dropout = False):
-    # For now dropout and bidirectional aren't included here, can change that down the line
-    # output_size for Hindcast doesn't actually matter
-    # Grey Nearing says this direct passover doesn't work, ned to warm it up somehow (so need more of an intersection)
-    # Hindcast part is never bidirectional
-    Hindcast = Hindcast_LSTM_Block(hindcast_input_size, hindcast_hidden_size, num_layers, hindcast_output_size, dropout = dropout, bidirectional = bidirectional, eval_dropout = eval_dropout)
-    Forecast = Forecast_LSTM_Block(forecast_input_size, forecast_hidden_size, num_layers, forecast_output_size, dropout = dropout, bidirectional = bidirectional, eval_dropout = eval_dropout)
-
-    size_multiplier = 2
-
-    Handover = NN(input_size= hindcast_hidden_size*2, hidden_size= handoff_hidden_size, output_size = forecast_hidden_size*size_multiplier)
-    Block = Google_LSTMModel(Hindcast, Forecast, Handover)
-    Block.to(device)
-
-    return Block
-    
-    
-
-# ## Dataloaders
 
 class Multi_Basins_HF_LSTMDataGenerator(Dataset):
     def __init__(self, valid_start_dates, ERA5_Land, HRES, Static_df, Discharge, scalers, basin_indices, Hind_variables, Fore_variables, history_sequence_length, forecast_sequence_length):
@@ -336,7 +219,6 @@ class Multi_Basins_HF_LSTMDataGenerator(Dataset):
         return Hist_X_Chunk_Torch, Fore_X_Chunk_Torch, Y_value, str(end_prediction_date), basin_idx
 
 
-
 class Multi_Basins_HF_LSTMDataGenerator_Binary(Dataset):
     def __init__(self, valid_start_dates, ERA5_Land, HRES, Static_df, Discharge, scalers, basin_indices, Hind_variables, Fore_variables, history_sequence_length, forecast_sequence_length, p = 0.125):
         """
@@ -419,6 +301,282 @@ class Multi_Basins_HF_LSTMDataGenerator_Binary(Dataset):
         
         return Hist_X_Chunk_Torch, Fore_X_Chunk_Torch, Y_value, str(end_prediction_date), basin_idx
 
+class CRPSLoss_Ensemble(nn.Module):
+    """
+    Continuous Ranked Probability Score (CRPS) implemented as a PyTorch loss function.
+    
+    This loss function evaluates the quality of probabilistic forecasts by comparing
+    the forecasted distribution with the observed values.
+    
+    Lower CRPS values indicate better forecasts.
+    """
+    
+    def __init__(self, clip_value=-0.26787253, smooth_epsilon=0.01):
+        """
+        Initialize the CRPS loss function.
+        
+        Args:
+            clip_value (float): Value to clip forecasts at. Defaults to -0.26787253.
+            smooth_epsilon (float): Parameter for smoothing the heaviside function.
+        """
+        super(CRPSLoss_Ensemble, self).__init__()
+        self.clip_value = clip_value
+        self.smooth_epsilon = smooth_epsilon
+        
+    def smooth_heaviside(self, x, epsilon=0.01):
+        """
+        Smooth approximation of the heaviside function that maintains gradients.
+        
+        Args:
+            x: Input tensor
+            epsilon: Smoothing parameter (smaller = sharper transition)
+            
+        Returns:
+            Smoothed approximation of the heaviside function
+        """
+        return torch.sigmoid(x / epsilon)        
+    def forward(self, forecasts, observation):
+        """
+        Calculate the Continuous Ranked Probability Score (CRPS).
+        
+        Args:
+            forecasts: Tensor of ensemble forecasts with shape (n_members, batch_size, num_steps)
+            observation: Tensor of true observations with shape (batch_size, num_steps)
+            
+        Returns:
+            Tensor of CRPS scores with shape (batch_size, num_steps)
+        """
+        # Clip forecasts if needed
+        forecasts = torch.clamp(forecasts, min=self.clip_value)
+        
+        # Get dimensions
+        n_members, batch_size, num_steps = forecasts.shape
+        
+        # Reshape forecasts to (batch_size * num_steps, n_members)
+        forecasts_reshaped = forecasts.permute(1, 2, 0).reshape(batch_size * num_steps, n_members)
+        
+        # Sort the forecasts along the ensemble dimension
+        sorted_forecasts, _ = torch.sort(forecasts_reshaped, dim=1)
+        
+        # Reshape observations to match forecasts
+        observations_flat = observation.reshape(batch_size * num_steps, 1)
+        observations_expanded = observations_flat.expand(-1, n_members)
+        
+        # Calculate heaviside function (indicator of whether forecast >= observation)
+        heaviside  = self.smooth_heaviside(sorted_forecasts - observations_expanded, self.smooth_epsilon)
+        # Create ranks and normalize
+        ranks = torch.arange(1, n_members + 1, device=forecasts.device, dtype=torch.float) / n_members
+        
+        # Calculate CRPS
+        crps_flat = torch.mean((heaviside - ranks)**2, dim=1)
+        
+        # Reshape back to (batch_size, num_steps)
+        crps_scores = crps_flat.reshape(batch_size, num_steps)
+        
+        return crps_scores
+
+
+class Discrete_CRPSLoss(nn.Module):
+    """
+    Continuous Ranked Probability Score (CRPS) implemented as a PyTorch loss function.
+    
+    This loss function evaluates the quality of probabilistic forecasts by comparing
+    the forecasted distribution with the observed values.
+    
+    Lower CRPS values indicate better forecasts.
+    """
+    
+    def __init__(self, clip_value=-0.26787253, epsilon= 1e-4):
+        """
+        Initialize the CRPS loss function.
+        
+        Args:
+            clip_value (float): Value to clip forecasts at. Defaults to -0.26787253.
+            smooth_epsilon (float): Parameter for smoothing the heaviside function.
+        """
+        super(Discrete_CRPSLoss, self).__init__()
+        self.clip_value = clip_value
+        self.epsilon = epsilon
+          
+    def forward(self, forecasts, observation):
+        """
+        Calculate the Continuous Ranked Probability Score (CRPS).
+        
+        Args:
+            forecasts: Tensor of ensemble forecasts with shape (n_members, batch_size, num_steps)
+            observation: Tensor of true observations with shape (batch_size, num_steps)
+            
+        Returns:
+            Tensor of CRPS scores with shape (batch_size, num_steps)
+        """
+        # Clip forecasts if needed
+        forecasts = torch.clamp(forecasts, min=self.clip_value)
+        
+        # Get dimensions
+        n_members, batch_size, num_steps = forecasts.shape
+        
+        # Reshape forecasts to (batch_size * num_steps, n_members)
+        forecasts_reshaped = forecasts.permute(1, 2, 0)
+
+        observations_expanded = observation.unsqueeze(-1)
+        
+        term1 = torch.abs(forecasts_reshaped - observations_expanded).mean(dim= -1)
+ 
+        x_j = forecasts_reshaped.unsqueeze(3)  # (batch_size, num_steps, n_members, 1)
+        x_k = forecasts_reshaped.unsqueeze(2)  # (batch_size, num_steps, 1, n_members)
+        pairwise_diffs = torch.abs(x_j - x_k)
+        term2 = pairwise_diffs.sum(dim=(2, 3)) / (2 * n_members * (n_members - 1))
+        crps_scores = term1 - ((1 - self.epsilon)* term2)
+        return crps_scores
+
+
+def load_scalers(output_path = 'scalers'):
+    """Load saved scalers"""
+    scalers = joblib.load(f'{output_path}.joblib')
+    return scalers
+
+
+def load_dataloaders(batch_size = 128, history_sequence_length = 90, forecast_sequence_length = 10, ML_functions = None):
+    batch_size = 128
+    
+    # loaded_traning_data0 = torch.load("/perm/mokr/10Day_Loss_Function_Training_Dataset0_test.pt")
+    # Training_Dataset0 = HydroDataset(loaded_traning_data0)
+    
+    # loaded_traning_data1 = torch.load("/perm/mokr/10Day_Loss_Function_Training_Dataset1_test.pt")
+    # Training_Dataset1 = HydroDataset(loaded_traning_data1)
+    
+    # loaded_traning_data2 = torch.load("/perm/mokr/10Day_Loss_Function_Training_Dataset2_test.pt")
+    # Training_Dataset2 = HydroDataset(loaded_traning_data2)
+
+    # loaded_traning_data3 = torch.load("/perm/mokr/10Day_Loss_Function_Training_Dataset3_test.pt")
+    # Training_Dataset3 = HydroDataset(loaded_traning_data3)
+    
+    loaded_traning_data4 = torch.load("/perm/mokr/10Day_Loss_Function_Training_Dataset4_test.pt")
+    Training_Dataset4 = HydroDataset(loaded_traning_data4)
+
+    combined_data = []
+    datasets = [Training_Dataset4]
+    # datasets = [Training_Dataset0, Training_Dataset1, Training_Dataset2, Training_Dataset3 , Training_Dataset4]
+
+    # Append data from each dataset to the combined list
+    for dataset in datasets:
+        combined_data.extend(dataset.data)
+    
+    Full_Training_Dataset = HydroDataset(combined_data)
+    
+    
+    Training_Dataloader = DataLoader(Full_Training_Dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
+
+    loaded_data = torch.load("/perm/mokr/10Day_Loss_Function_Validation_Dataset_Binary_P0_test.pt")
+    Validation_Dataset = ML_functions.HydroDataset(loaded_data)
+    # Make batch_size bigger later
+    Validation_Dataloader = DataLoader(Validation_Dataset, batch_size= batch_size, shuffle=False, pin_memory=True)
+
+
+    return Training_Dataloader, Validation_Dataloader
+
+
+def process_era5_land_data(era5_land, basin_idx, start_date, end_date, hind_variables, scalers):
+    """
+    Selects, converts, and scales ERA5 Land data in a single function.
+    
+    Args:
+        era5_land (xarray.Dataset): Original ERA5 Land dataset
+        basin_idx (str): Basin index to select
+        start_date (pd.Timestamp): Start date for data selection
+        end_date (pd.Timestamp): End date for data selection
+        hind_variables (list): List of historical variables to process
+        scalers (dict): Dictionary of scalers for each variable
+    
+    Returns:
+        np.ndarray: Scaled ERA5 Land data
+    """
+    # Select data for specific basin and date range
+    ERA5L_xr = era5_land.sel(basin=basin_idx, date=slice(start_date, end_date))
+    
+    # Convert to numpy array
+    ERA5L_np = ERA5L_xr[hind_variables].to_array().T.values
+    
+    # Prepare scaled array
+    ERA5L_scaled = np.zeros_like(ERA5L_np)
+    
+    # Apply scalers to each variable
+    for i, var in enumerate(hind_variables):
+        # Check if a scaler exists for this variable
+        if var in scalers:
+            # Apply scaler to the column
+            ERA5L_scaled[:, i] = scalers[var].transform(
+                ERA5L_np[:, i].reshape(-1, 1)
+            ).flatten()
+    
+    return ERA5L_scaled
+
+
+def process_hres_data(hres, basin_idx, end_date, forecast_sequence_length, fore_variables, era5_land_scalers):
+    """
+    Selects, converts, and scales HRES forecast data in a single function.
+    
+    Args:
+        hres (xarray.Dataset): HRES dataset
+        basin_idx (str): Basin index to select
+        end_date (pd.Timestamp): End date for historical data
+        forecast_sequence_length (int): Length of forecast sequence
+        fore_variables (list): List of forecast variables
+        era5_land_scalers (dict): Scalers for ERA5 Land variables
+    
+    Returns:
+        np.ndarray: Scaled HRES forecast data
+    """
+    # Extract HRES data for the specific basin and end date
+    HRES_Basin = hres.sel(basin=basin_idx, date=end_date)
+    HRES_xr = HRES_Basin.isel(lead_time=slice(0, forecast_sequence_length))
+    HRES_np = HRES_xr[fore_variables].to_array().T.values
+    
+    # Prepare scaled array
+    HRES_scaled = np.zeros_like(HRES_np)
+    
+    # Process and scale each variable
+    for i, var in enumerate(fore_variables):            
+        # Extract short variable name (part after underscore or full name)
+        short_var = var.split('_', 1)[1] if '_' in var else var
+        
+        # Find matching scaler key
+        matching_key = next(
+            (scaler_key for scaler_key in era5_land_scalers 
+             if (scaler_key.split('_', 1)[1] if '_' in scaler_key else scaler_key) == short_var),
+            None
+        )
+        
+        # Apply the scaler if found
+        if matching_key:
+            HRES_scaled[:, i] = era5_land_scalers[matching_key].transform(
+                HRES_np[:, i].reshape(-1, 1)
+            ).flatten()
+    
+    return HRES_scaled
+
+
+def prepare_masked_discharge(Fore_Discharge, p=0.125):
+    """
+    Prepare masked discharge with probabilistic masking.
+    
+    Args:
+        Fore_Discharge (np.ndarray): Original forecast discharge values
+        p (float): Probability of showing the true discharge value (default 0.125)
+    
+    Returns:
+        tuple: Masked discharge array and mask array
+    """
+    # Create a random mask based on probability p
+    mask = np.random.random(Fore_Discharge.shape) < p
+    
+    # Create masked discharge array
+    masked_discharge = np.where(mask, Fore_Discharge, 0)
+    
+    return masked_discharge, mask.astype(float)
+
+
+
 
 def train_model(Model, Dataloader, optimizer, criterion, epochs=3, train_mode = True, batch_accumulation=50, device = 'cpu', scheduler = None):
     """
@@ -482,6 +640,7 @@ def train_model(Model, Dataloader, optimizer, criterion, epochs=3, train_mode = 
             scheduler.step()
             
     return epoch_losses
+
 
 def train_model_CMAL(Model, Dataloader, optimizer, criterion, epochs=3, train_mode = True, batch_accumulation=50, device = 'cpu', scheduler = None, use_observations = True):
     """
@@ -570,37 +729,9 @@ def train_model_CMAL(Model, Dataloader, optimizer, criterion, epochs=3, train_mo
                 else: 
                     # Calculate validation statistics
                     num_members = 11
-                    
-                    # ensemble_predictions, original_predictions =  get_ensemble_members_vectorized(Model, Hist_X_Chunk_Torch, Fore_X_Chunk_Torch[:,:,0:15], num_members= num_members, keep_original = True, device = device)
 
-                    # ensemble_predictions[ensemble_predictions < -0.26787253] = -0.2678724
-                    # original_predictions[original_predictions < -0.26787253] = -0.2678724
-                    # predictions = Model(Hist_X_Chunk_Torch.to(torch.float32), Fore_X_Chunk_Torch.to(torch.float32))[1]
-                    # param_predictions = transform_CMAL_parameters_multi(predictions)
-                
-                    
-                    # param_predictions = {
-                    #     'mu': param_predictions[:, :, ::4],   # mu is at indices 0 mod 4
-                    #     'b': param_predictions[:, :, 1::4],   # b is at indices 1 mod 4 (ensure positive)
-                    #     'tau': param_predictions[:, :, 2::4], # tau is at indices 2 mod 4 (ensure 0-1)
-                    #     'pi': param_predictions[:, :, 3::4],  # pi is at indices 3 mod 4
-                    # }
-                
-                    # greedy_ensembles = generate_greedy_trajectories(original_predictions, param_predictions, Model, Fore_X_Chunk_Torch, Hist_X_Chunk_Torch)
-                    # greedy_ensemble_summary = get_member_summaries_torch(greedy_ensembles)
-                    # all_greedy_ensemble_summaries.append(greedy_ensemble_summary)
-                    
-                    # crps = compute_crps(ensemble_predictions, Y_value)
-                    
-                    # conditional_ensemble_summary = get_member_summaries_torch(ensemble_predictions)                    
-                    
 
-                    # discharge_summary = get_member_summaries_torch(Y_value.unsqueeze(0))
-                                         
-                    # all_conditional_ensemble_summaries.append(conditional_ensemble_summary)
-                
-                    # all_discharge_summaries.append(discharge_summary)
-                    # CRPS_Per_leadtime.append(crps)
+            
                     
             average_loss += loss.item()    # loss = criterion(prediction.squeeze(), Y_value)
             
@@ -623,734 +754,6 @@ def train_model_CMAL(Model, Dataloader, optimizer, criterion, epochs=3, train_mo
         return epoch_losses
     else:
         return epoch_losses #[epoch_losses, all_conditional_ensemble_summaries, all_greedy_ensemble_summaries, all_discharge_summaries, CRPS_Per_leadtime]
-
-
-
-
-def process_era5_land_data(era5_land, basin_idx, start_date, end_date, hind_variables, scalers):
-    """
-    Selects, converts, and scales ERA5 Land data in a single function.
-    
-    Args:
-        era5_land (xarray.Dataset): Original ERA5 Land dataset
-        basin_idx (str): Basin index to select
-        start_date (pd.Timestamp): Start date for data selection
-        end_date (pd.Timestamp): End date for data selection
-        hind_variables (list): List of historical variables to process
-        scalers (dict): Dictionary of scalers for each variable
-    
-    Returns:
-        np.ndarray: Scaled ERA5 Land data
-    """
-    # Select data for specific basin and date range
-    ERA5L_xr = era5_land.sel(basin=basin_idx, date=slice(start_date, end_date))
-    
-    # Convert to numpy array
-    ERA5L_np = ERA5L_xr[hind_variables].to_array().T.values
-    
-    # Prepare scaled array
-    ERA5L_scaled = np.zeros_like(ERA5L_np)
-    
-    # Apply scalers to each variable
-    for i, var in enumerate(hind_variables):
-        # Check if a scaler exists for this variable
-        if var in scalers:
-            # Apply scaler to the column
-            ERA5L_scaled[:, i] = scalers[var].transform(
-                ERA5L_np[:, i].reshape(-1, 1)
-            ).flatten()
-    
-    return ERA5L_scaled
-
-def process_hres_data(hres, basin_idx, end_date, forecast_sequence_length, fore_variables, era5_land_scalers):
-    """
-    Selects, converts, and scales HRES forecast data in a single function.
-    
-    Args:
-        hres (xarray.Dataset): HRES dataset
-        basin_idx (str): Basin index to select
-        end_date (pd.Timestamp): End date for historical data
-        forecast_sequence_length (int): Length of forecast sequence
-        fore_variables (list): List of forecast variables
-        era5_land_scalers (dict): Scalers for ERA5 Land variables
-    
-    Returns:
-        np.ndarray: Scaled HRES forecast data
-    """
-    # Extract HRES data for the specific basin and end date
-    HRES_Basin = hres.sel(basin=basin_idx, date=end_date)
-    HRES_xr = HRES_Basin.isel(lead_time=slice(0, forecast_sequence_length))
-    HRES_np = HRES_xr[fore_variables].to_array().T.values
-    
-    # Prepare scaled array
-    HRES_scaled = np.zeros_like(HRES_np)
-    
-    # Process and scale each variable
-    for i, var in enumerate(fore_variables):            
-        # Extract short variable name (part after underscore or full name)
-        short_var = var.split('_', 1)[1] if '_' in var else var
-        
-        # Find matching scaler key
-        matching_key = next(
-            (scaler_key for scaler_key in era5_land_scalers 
-             if (scaler_key.split('_', 1)[1] if '_' in scaler_key else scaler_key) == short_var),
-            None
-        )
-        
-        # Apply the scaler if found
-        if matching_key:
-            HRES_scaled[:, i] = era5_land_scalers[matching_key].transform(
-                HRES_np[:, i].reshape(-1, 1)
-            ).flatten()
-    
-    return HRES_scaled
-
-def prepare_masked_discharge(Fore_Discharge, p=0.125):
-    """
-    Prepare masked discharge with probabilistic masking.
-    
-    Args:
-        Fore_Discharge (np.ndarray): Original forecast discharge values
-        p (float): Probability of showing the true discharge value (default 0.125)
-    
-    Returns:
-        tuple: Masked discharge array and mask array
-    """
-    # Create a random mask based on probability p
-    mask = np.random.random(Fore_Discharge.shape) < p
-    
-    # Create masked discharge array
-    masked_discharge = np.where(mask, Fore_Discharge, 0)
-    
-    return masked_discharge, mask.astype(float)
-
-
-# ## Loss Functions
-
-def calculate_kge(observed, simulated):
-    """
-    Calculate Kling-Gupta Efficiency for timeseries data.
-    
-    Parameters:
-    -----------
-    observed : array-like
-        Observed timeseries values
-    simulated : array-like
-        Simulated timeseries values
-        
-    Returns:
-    --------
-    float
-        KGE value (range: -∞ to 1, where 1 is perfect)
-    """
-    # Ensure inputs are numpy arrays
-    observed = np.array(observed)
-    simulated = np.array(simulated)
-    
-    # Add small constant to avoid division by zero
-    eps = 1e-6
-    
-    # Calculate components
-    mean_obs = np.mean(observed)
-    mean_sim = np.mean(simulated)
-    std_obs = np.std(observed)
-    std_sim = np.std(simulated)
-    
-    # Correlation coefficient
-    r = np.corrcoef(observed, simulated)[0, 1]
-    
-    # Ratio of means (beta)
-    beta = mean_sim / (mean_obs + eps)
-    
-    # Ratio of standard deviations (alpha)
-    alpha = std_sim / (std_obs + eps)
-    
-    # Calculate KGE
-    kge = 1 - np.sqrt((r - 1)**2 + (beta - 1)**2 + (alpha - 1)**2)
-    
-    return kge
-
-# Need to add dates to x axis
-
-class CRPSLoss(nn.Module):
-    """
-    PyTorch module implementing CRPS loss for a mixture of asymmetric Laplacian distributions
-    
-    This loss can be used directly in standard PyTorch training loops.
-    """
-    def __init__(self, num_integration_points=100, truncate = True):
-        """
-        Initialize the CRPS loss function
-        
-        Args:
-            num_integration_points (int): Number of points to use for numerical integration
-        """
-        super(CRPSLoss, self).__init__()
-        self.num_integration_points = num_integration_points
-    def forward(self, param_predictions, observations):
-        """
-        Calculate CRPS loss for a batch of predictions
-        
-        Args:
-            param_predictions (dict): Dictionary with distribution parameters
-                                     'mu': location parameters (batch_size, num_components)
-                                     'b': scale parameters (batch_size, num_components)
-                                     'tau': asymmetry parameters (batch_size, num_components)
-                                     'pi': mixture weights (batch_size, num_components)
-            observations (torch.Tensor): Observed values (shape: (batch_size,))
-            
-        Returns:
-            torch.Tensor: CRPS loss (shape: (batch_size,))
-        """
-        batch_size = observations.shape[0]
-        
-        # Extract parameters for asymmetric Laplacian mixture
-        m = param_predictions['mu']  # (batch_size, num_components)
-        b = param_predictions['b']   # (batch_size, num_components)
-        t = param_predictions['tau'] # (batch_size, num_components)
-        pi = param_predictions['pi'] # (batch_size, num_components)
-        
-        # Ensure pi sums to 1 along component dimension
-        pi = pi / torch.sum(pi, dim=1, keepdim=True)
-        
-        # Calculate proper mean and standard deviation for each component
-        # Mean = mu + b * (1 - 2*tau) / (tau * (1 - tau))
-        component_means = m + b * (1 - 2*t) / (t * (1 - t))
-        
-        # Variance = b^2 * (1 - 2*tau + 2*tau^2) / (tau^2 * (1 - tau)^2)
-        component_vars = b**2 * (1 - 2*t + 2*t**2) / (t**2 * (1 - t)**2)
-        component_stds = torch.sqrt(component_vars)
-        
-        # Calculate mixture mean (weighted average of component means)
-        mixture_mean = torch.sum(pi * component_means, dim=1)  # (batch_size,)
-        
-        # Calculate mixture variance: E[(X-μ)²] = Σπ_i[(μ_i-μ)² + σ_i²]
-        mean_variance = torch.sum(pi * (component_means - mixture_mean.unsqueeze(1))**2, dim=1)
-        avg_variance = torch.sum(pi * component_vars, dim=1)
-        mixture_var = mean_variance + avg_variance
-        mixture_std = torch.sqrt(mixture_var)
-        
-        mean_avg = torch.mean(mixture_mean)
-        std_avg = torch.mean(mixture_std)
-        
-        # Use mean±5*std 
-        lower_bound = (mean_avg - 2 * std_avg).item()
-        upper_bound = (mean_avg + 4 * std_avg).item()
-        
-        # Create integration points
-        integration_points = torch.linspace(lower_bound, upper_bound, self.num_integration_points, device=observations.device)
-        integration_points = integration_points.repeat(batch_size, 1)  # (batch_size, num_integration_points)
-
-        if truncate:
-            integration_points[integration_points < -0.26787253] = -0.26787253
-        
-        # Compute CDF at integration points
-        cdf_values = self._compute_mixture_cdf(integration_points, param_predictions)
-        
-        # Calculate heaviside step function (1 if integration_point >= observation, 0 otherwise)
-        observations_expanded = observations.unsqueeze(1).expand_as(integration_points)
-        heaviside = (integration_points >= observations_expanded).float()
-        
-        # Calculate squared difference
-        squared_diff = (cdf_values - heaviside) ** 2
-        
-        # Numerical integration using trapezoidal rule
-        dx = (upper_bound - lower_bound) / (self.num_integration_points - 1)
-        integrated_values = 0.5 * dx * (squared_diff[:, :-1] + squared_diff[:, 1:])
-        crps = torch.sum(integrated_values, dim=1)  # Sum over integration points
-        crps = torch.sum(crps)
-        return crps
-    
-    def _compute_mixture_cdf(self, integration_points, param_predictions):
-        """
-        Compute CDF of a mixture of asymmetric Laplacian distributions
-        
-        Args:
-            x (torch.Tensor): Points to evaluate CDF at (shape: (batch_size, num_points))
-            params (dict): Dictionary with distribution parameters
-        
-        Returns:
-            torch.Tensor: CDF values (shape: (batch_size, num_points))
-        """
-        # Get parameters
-        m = param_predictions['mu']  # (batch_size, num_components)
-        b = param_predictions['b']   # (batch_size, num_components)
-        t = param_predictions['tau'] # (batch_size, num_components)
-        pi = param_predictions['pi'] # (batch_size, num_components)
-        
-        # Ensure pi sums to 1 along component dimension
-        pi = pi / torch.sum(pi, dim=1, keepdim=True)
-        
-        # Expand dimensions for broadcasting
-        # y: (batch_size, num_points, 1)
-        # m: (batch_size, 1, num_components)
-        integration_points_expanded = integration_points.unsqueeze(-1)  
-        m_expanded = m.unsqueeze(1)
-        b_expanded = b.unsqueeze(1)
-        t_expanded = t.unsqueeze(1)
-        pi_expanded = pi.unsqueeze(1)
-        
-        # Calculate normalized error
-        error = integration_points_expanded - m_expanded  # (batch_size, num_points, num_components)
-        
-        # Calculate CDF value based on error sign
-        greater_mask = error > 0
-        less_mask = ~greater_mask
-        
-        # Initialize CDF tensor
-        component_cdfs = torch.zeros_like(error)
-        
-        # Handle positive errors
-        if torch.any(less_mask):
-            component_cdfs[less_mask] = t_expanded.expand_as(error)[less_mask] * torch.exp(
-                (1 - t_expanded.expand_as(error)[less_mask]) * error[less_mask] / b_expanded.expand_as(error)[less_mask]
-            )
-        
-        # Handle negative errors
-        if torch.any(greater_mask):
-            component_cdfs[greater_mask] = 1 - (1 - t_expanded.expand_as(error)[greater_mask]) * torch.exp(
-                (-t_expanded.expand_as(error)[greater_mask]) * error[greater_mask] / b_expanded.expand_as(error)[greater_mask]
-            )
-        
-        # Apply mixture weights and sum over components
-        cdf_values = torch.sum(pi_expanded.expand_as(component_cdfs) * component_cdfs, dim=2)
-        
-        return cdf_values
-
-class CMALLoss(nn.Module):
-    # Negative log-likelihood for a single asymmetric Laplacian distribution
-    # Taken from Neural Hydrology, uses Alternative parameterization for Bayesian quantile regression (wikipedia)
-    def __init__(self, eps=1e-8):
-        super(CMALLoss, self).__init__()
-        self.eps = eps  # Small constant for numerical stability
-
-    def forward(self, prediction: dict[str, torch.Tensor], ground_truth: dict[str, torch.Tensor]):
-        mask = ~torch.isnan(ground_truth['y'])
-        
-        # Apply mask to all relevant tensors
-        y = ground_truth['y'][mask]
-        m = prediction['mu'][mask]
-        b = prediction['b'][mask]
-        t = prediction['tau'][mask]
-        p = prediction['pi'][mask]    
-        error = y.unsqueeze(-1) - m
-        log_like = (torch.log(t  + self.eps) + 
-                    torch.log(1.0 - t  + self.eps) - 
-                    torch.log(b  + self.eps) - 
-                    torch.max(t * error, (t - 1.0) * error) / (b + self.eps))
-        
-        log_weights = torch.log(p + self.eps)  # Prevent log(0) issues
-    
-        result = torch.logsumexp(log_weights + log_like, dim=-1)  # Use dim=-1 for flexibility
-        
-        result = -torch.mean(result, dim=-1)
-        return result
-
-class KGELoss(nn.Module):
-    """
-    Kling-Gupta Efficiency loss for batched predictions with multiple timesteps.
-    KGE = 1 - sqrt((r - 1)^2 + (alpha - 1)^2 + (beta - 1)^2)
-    where:
-    r = correlation coefficient
-    alpha = std(sim)/std(obs)
-    beta = mean(sim)/mean(obs)
-    
-    Handles inputs of shape [batch_size, timesteps]
-    """
-    def __init__(self, reduction='mean'):
-        super(KGELoss, self).__init__()
-        self.reduction = reduction
-        
-    def forward(self, simulated, observed):
-        """
-        Args:
-            simulated (torch.Tensor): Simulated values of shape [batch_size, timesteps]
-            observed (torch.Tensor): Observed values of shape [batch_size, timesteps]
-        Returns:
-            torch.Tensor: KGE loss
-        """
-        # Ensure the tensors are floating point
-        sim = simulated.float()
-        obs = observed.float()
-        
-        # Handle potential NaN values
-        eps = 1e-12
-        
-        # Calculate means along timestep dimension
-        sim_mean = torch.mean(sim, dim=1)  # Shape: [batch_size]
-        obs_mean = torch.mean(obs, dim=1)  # Shape: [batch_size]
-        
-        # Calculate standard deviations along timestep dimension
-        sim_std = torch.std(sim, dim=1)  # Shape: [batch_size]
-        obs_std = torch.std(obs, dim=1)  # Shape: [batch_size]
-        
-        # Calculate correlation coefficient for each sample in the batch
-        sim_norm = sim - sim_mean.unsqueeze(1)  # Shape: [batch_size, timesteps]
-        obs_norm = obs - obs_mean.unsqueeze(1)  # Shape: [batch_size, timesteps]
-        
-        # Calculate numerator and denominator for correlation
-        numerator = torch.sum(sim_norm * obs_norm, dim=1)  # Shape: [batch_size]
-        sim_norm_sum = torch.sum(sim_norm ** 2, dim=1)  # Shape: [batch_size]
-        obs_norm_sum = torch.sum(obs_norm ** 2, dim=1)  # Shape: [batch_size]
-        
-        # Add epsilon for numerical stability
-        denominator = torch.sqrt(sim_norm_sum * obs_norm_sum + eps)
-        r = numerator / denominator  # Shape: [batch_size]
-        
-        # Calculate alpha (ratio of standard deviations)
-        alpha = sim_std / (obs_std + eps)  # Shape: [batch_size]
-        
-        # Calculate beta (ratio of means)
-        # Handle the case where observed mean is zero or very small
-        beta = sim_mean / (obs_mean + eps)
-        # Calculate KGE for each sample in the batch
-        kge = 1 - torch.sqrt((r - 1) ** 2 + (alpha - 1) ** 2 + (beta - 1) ** 2)  # Shape: [batch_size]
-        
-        # Convert to loss (1 - KGE, since KGE's optimal value is 1)
-        loss = 1 - kge  # Shape: [batch_size]
-        
-        if self.reduction == 'mean':
-            return torch.mean(loss)
-        elif self.reduction == 'sum':
-            return torch.sum(loss)
-        else:  # 'none'
-            return loss
-
-
-def calculate_crps(x, y):
-    """
-    Computes CRPS from x using y as reference,
-    first x dimension must be ensembles, next dimensions can be arbitrary
-    x: ensemble data (n_ens, n_points)
-    y: observation/analysis data (n_points)
-    returns: crps (n_points)
-    REFERENCE
-      Hersbach, 2000: Decomposition of the Continuous Ranked Probability Score for Ensemble Prediction Systems.
-      Weather and Forecasting 15: 559-570.
-    """
-
-    # first sort ensemble
-    x.sort(axis=0)
-
-    # construct alpha and beta, size nens+1
-    n_ens = x.shape[0]
-    shape = (n_ens+1,)+x.shape[1:]
-    alpha = np.zeros(shape)
-    beta = np.zeros(shape)
-
-    # x[i+1]-x[i] and x[i]-y[i] arrays
-    diffxy = x-y.reshape(1, *(y.shape))
-    diffxx = x[1:]-x[:-1]  # x[i+1]-x[i], size ens-1
-
-    # if i == 0
-    alpha[0] = 0
-    beta[0] = np.fmax(diffxy[0], 0)  # x(0)-y
-    # if i == n_ens
-    alpha[-1] = np.fmax(-diffxy[-1], 0)  # y-x(n)
-    beta[-1] = 0
-    # else
-    alpha[1:-1] = np.fmin(diffxx, np.fmax(-diffxy[:-1], 0))  # x(i+1)-x(i) or y-x(i) or 0
-    beta[1:-1] = np.fmin(diffxx, np.fmax(diffxy[1:], 0))  # 0 or x(i+1)-y or x(i+1)-x(i)
-
-    # compute crps
-    p_exp = (np.arange(n_ens+1)/float(n_ens)).reshape(n_ens+1, *([1]*y.ndim))
-    crps = np.sum(alpha*(p_exp**2) + beta*((1-p_exp)**2), axis=0)
-    #
-    # p = np.arange(n_ens+1)/float(n_ens)
-    # alpha_mean = alpha.mean(axis=1)
-    # beat_mean = beta.mean(axis=1)
-    # crps = alpha_mean*(p**2) + beat_mean*((1-p)**2)
-    # crps_mean = crps2.sum()
-    #
-    # p_exp = np.expand_dims(np.arange(n_ens+1)/float(n_ens), axis=1)
-    # crps = np.nansum(alpha*(p_exp**2) + beta*((1-p_exp)**2), axis=0)
-    # crps_mean = crps.mean()
-    return crps
-
-
-def transform_CMAL_parameters(tensor):
-    """
-    Transform a tensor by applying:
-    - Softplus to the second element (index 1) of each row
-    - Sigmoid to the third element (index 2) of each row
-    
-    Args:
-        tensor: Input tensor of shape [batch_size, features]
-        
-    Returns:
-        Transformed tensor of the same shape
-    """
-    result = tensor.clone()
-    
-    # Apply softplus to the second column (index 1)
-    result[:, 1] = F.softplus(tensor[:, 1])
-    
-    # Apply sigmoid to the third column (index 2)
-    result[:, 2] = torch.sigmoid(tensor[:, 2])
-    
-    return result
-
-def transform_CMAL_parameters_multi(tensor):
-    '''
-    Generates predictions from a tensor representing multiple Asymetric Laplacians 
-    '''
-    # Input tensor of shape (b, m, 4n), batch, days, number of Asymmetric laplcians
-    b, m, n4 = tensor.shape
-    n = n4 // 4
-    
-    # Create a copy of the tensor to modify
-    result = tensor.clone()
-    
-    # Apply softplus to elements with index 1mod4 (positions 1, 5, 9, ...)
-    softplus_indices = torch.arange(1, n4, 4)
-    result[:, :, softplus_indices] = F.softplus(tensor[:, :, softplus_indices])
-    
-    # Apply sigmoid to elements with index 2mod4 (positions 2, 6, 10, ...)
-    sigmoid_indices = torch.arange(2, n4, 4)
-    result[:, :, sigmoid_indices] = torch.sigmoid(tensor[:, :, sigmoid_indices])
-    
-    # Apply softmax to every 4th element (indices 3mod4)
-    # First, reshape to extract these elements
-    softmax_indices = torch.arange(3, n4, 4)
-    
-    # Extract the elements to apply softmax to
-    softmax_elements = tensor[:, :, softmax_indices]
-    
-    # Apply softmax along dimension 1 (across the n elements)
-    softmax_result = F.softmax(softmax_elements, dim= -1)
-    
-    # Put the softmax result back in the original tensor
-    result[:, :, softmax_indices] = softmax_result
-    
-    return result
-
-
-
-def load_dataloaders(batch_size = 128, history_sequence_length = 90, forecast_sequence_length = 10, ML_functions = None):
-    batch_size = 128
-    
-    # loaded_traning_data0 = torch.load("/perm/mokr/10Day_Loss_Function_Training_Dataset0_test.pt")
-    # Training_Dataset0 = HydroDataset(loaded_traning_data0)
-    
-    # loaded_traning_data1 = torch.load("/perm/mokr/10Day_Loss_Function_Training_Dataset1_test.pt")
-    # Training_Dataset1 = HydroDataset(loaded_traning_data1)
-    
-    # loaded_traning_data2 = torch.load("/perm/mokr/10Day_Loss_Function_Training_Dataset2_test.pt")
-    # Training_Dataset2 = HydroDataset(loaded_traning_data2)
-
-    # loaded_traning_data3 = torch.load("/perm/mokr/10Day_Loss_Function_Training_Dataset3_test.pt")
-    # Training_Dataset3 = HydroDataset(loaded_traning_data3)
-    
-    loaded_traning_data4 = torch.load("/perm/mokr/10Day_Loss_Function_Training_Dataset4_test.pt")
-    Training_Dataset4 = HydroDataset(loaded_traning_data4)
-
-    combined_data = []
-    datasets = [Training_Dataset4]
-    # datasets = [Training_Dataset0, Training_Dataset1, Training_Dataset2, Training_Dataset3 , Training_Dataset4]
-
-    # Append data from each dataset to the combined list
-    for dataset in datasets:
-        combined_data.extend(dataset.data)
-    
-    Full_Training_Dataset = HydroDataset(combined_data)
-    
-    
-    Training_Dataloader = DataLoader(Full_Training_Dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
-
-    loaded_data = torch.load("/perm/mokr/10Day_Loss_Function_Validation_Dataset_Binary_P0_test.pt")
-    Validation_Dataset = ML_functions.HydroDataset(loaded_data)
-    # Make batch_size bigger later
-    Validation_Dataloader = DataLoader(Validation_Dataset, batch_size= batch_size, shuffle=False, pin_memory=True)
-
-
-    return Training_Dataloader, Validation_Dataloader
-
-class CRPSLoss_Ensemble(nn.Module):
-    """
-    Continuous Ranked Probability Score (CRPS) implemented as a PyTorch loss function.
-    
-    This loss function evaluates the quality of probabilistic forecasts by comparing
-    the forecasted distribution with the observed values.
-    
-    Lower CRPS values indicate better forecasts.
-    """
-    
-    def __init__(self, clip_value=-0.26787253, smooth_epsilon=0.01):
-        """
-        Initialize the CRPS loss function.
-        
-        Args:
-            clip_value (float): Value to clip forecasts at. Defaults to -0.26787253.
-            smooth_epsilon (float): Parameter for smoothing the heaviside function.
-        """
-        super(CRPSLoss_Ensemble, self).__init__()
-        self.clip_value = clip_value
-        self.smooth_epsilon = smooth_epsilon
-        
-    def smooth_heaviside(self, x, epsilon=0.01):
-        """
-        Smooth approximation of the heaviside function that maintains gradients.
-        
-        Args:
-            x: Input tensor
-            epsilon: Smoothing parameter (smaller = sharper transition)
-            
-        Returns:
-            Smoothed approximation of the heaviside function
-        """
-        return torch.sigmoid(x / epsilon)        
-    def forward(self, forecasts, observation):
-        """
-        Calculate the Continuous Ranked Probability Score (CRPS).
-        
-        Args:
-            forecasts: Tensor of ensemble forecasts with shape (n_members, batch_size, num_steps)
-            observation: Tensor of true observations with shape (batch_size, num_steps)
-            
-        Returns:
-            Tensor of CRPS scores with shape (batch_size, num_steps)
-        """
-        # Clip forecasts if needed
-        forecasts = torch.clamp(forecasts, min=self.clip_value)
-        
-        # Get dimensions
-        n_members, batch_size, num_steps = forecasts.shape
-        
-        # Reshape forecasts to (batch_size * num_steps, n_members)
-        forecasts_reshaped = forecasts.permute(1, 2, 0).reshape(batch_size * num_steps, n_members)
-        
-        # Sort the forecasts along the ensemble dimension
-        sorted_forecasts, _ = torch.sort(forecasts_reshaped, dim=1)
-        
-        # Reshape observations to match forecasts
-        observations_flat = observation.reshape(batch_size * num_steps, 1)
-        observations_expanded = observations_flat.expand(-1, n_members)
-        
-        # Calculate heaviside function (indicator of whether forecast >= observation)
-        heaviside  = self.smooth_heaviside(sorted_forecasts - observations_expanded, self.smooth_epsilon)
-        # Create ranks and normalize
-        ranks = torch.arange(1, n_members + 1, device=forecasts.device, dtype=torch.float) / n_members
-        
-        # Calculate CRPS
-        crps_flat = torch.mean((heaviside - ranks)**2, dim=1)
-        
-        # Reshape back to (batch_size, num_steps)
-        crps_scores = crps_flat.reshape(batch_size, num_steps)
-        
-        return crps_scores
-
-class Discrete_CRPSLoss(nn.Module):
-    """
-    Continuous Ranked Probability Score (CRPS) implemented as a PyTorch loss function.
-    
-    This loss function evaluates the quality of probabilistic forecasts by comparing
-    the forecasted distribution with the observed values.
-    
-    Lower CRPS values indicate better forecasts.
-    """
-    
-    def __init__(self, clip_value=-0.26787253, epsilon= 1e-4):
-        """
-        Initialize the CRPS loss function.
-        
-        Args:
-            clip_value (float): Value to clip forecasts at. Defaults to -0.26787253.
-            smooth_epsilon (float): Parameter for smoothing the heaviside function.
-        """
-        super(Discrete_CRPSLoss, self).__init__()
-        self.clip_value = clip_value
-        self.epsilon = epsilon
-          
-    def forward(self, forecasts, observation):
-        """
-        Calculate the Continuous Ranked Probability Score (CRPS).
-        
-        Args:
-            forecasts: Tensor of ensemble forecasts with shape (n_members, batch_size, num_steps)
-            observation: Tensor of true observations with shape (batch_size, num_steps)
-            
-        Returns:
-            Tensor of CRPS scores with shape (batch_size, num_steps)
-        """
-        # Clip forecasts if needed
-        forecasts = torch.clamp(forecasts, min=self.clip_value)
-        
-        # Get dimensions
-        n_members, batch_size, num_steps = forecasts.shape
-        
-        # Reshape forecasts to (batch_size * num_steps, n_members)
-        forecasts_reshaped = forecasts.permute(1, 2, 0)
-
-        observations_expanded = observation.unsqueeze(-1)
-        
-        term1 = torch.abs(forecasts_reshaped - observations_expanded).mean(dim= -1)
- 
-        x_j = forecasts_reshaped.unsqueeze(3)  # (batch_size, num_steps, n_members, 1)
-        x_k = forecasts_reshaped.unsqueeze(2)  # (batch_size, num_steps, 1, n_members)
-        pairwise_diffs = torch.abs(x_j - x_k)
-        term2 = pairwise_diffs.sum(dim=(2, 3)) / (2 * n_members * (n_members - 1))
-        crps_scores = term1 - ((1 - self.epsilon)* term2)
-        return crps_scores
-
-
-def run_ensemble_predictions(Model, Hist_X, Fore_X, num_members=4, noise_scale=1.0, fixed_noise = False):
-    """
-    Run model predictions with an additional row of random noise each time.
-    
-    Args:
-        Model: The model to generate predictions
-        Hist_X: Historical data tensor [batch_size, seq_len, features]
-        Fore_X: Forecast data tensor [batch_size, seq_len, features]
-        num_members: Number of ensemble members to generate
-        noise_scale: Scale of random noise to add
-        
-    Returns:
-        Tensor of ensemble predictions [num_members, batch_size, num_steps]
-    """
-    batch_size = Hist_X.shape[0]
-    hist_seq_len = Hist_X.shape[1]
-    hist_features = Hist_X.shape[2]
-    fore_seq_len = Fore_X.shape[1]
-    fore_features = Fore_X.shape[2]
-    device = Hist_X.device
-    
-    # List to store all predictions
-    all_predictions = []
-
-
-    for member_idx in range(num_members):
-        # Create noise rows for both historical and forecast data
-        with torch.no_grad():
-            hist_noise = noise_scale * torch.randn(batch_size, hist_seq_len, 1, device=device)
-            fore_noise = noise_scale * torch.randn(batch_size, fore_seq_len, 1, device=device)
-
-            
-            if fixed_noise == True:
-                # Generate single random noise value per batch item
-                batch_noise = noise_scale * torch.randn(batch_size, 1, 1, device=device)
-                
-                # Repeat this same noise value across the sequence length dimensions
-                hist_noise = batch_noise.repeat(1, hist_seq_len, 1)
-                fore_noise = batch_noise.repeat(1, fore_seq_len, 1)
-
-        # Concatenate noise as an additional feature
-        hist_with_noise = torch.cat([Hist_X, hist_noise], dim=2)
-        fore_with_noise = torch.cat([Fore_X, fore_noise], dim=2)
-        
-        # Run the model with the augmented input
-        prediction = Model(hist_with_noise, 
-                            fore_with_noise)[1]
-        
-        # Add this prediction to our collection
-        all_predictions.append(prediction)
-
-
-        del hist_with_noise, fore_with_noise
-    
-    # Stack all predictions to create a tensor with shape [num_members, batch_size, num_steps]
-    ensemble_predictions = torch.stack(all_predictions, dim=0)
-    
-    return ensemble_predictions
 
 
 def train_seeded_model(model, optimizer, Training_Dataloader, epochs=3, batch_accumulation_size=300, 
@@ -1454,6 +857,262 @@ def train_seeded_model(model, optimizer, Training_Dataloader, epochs=3, batch_ac
     return loss_history
 
 
+def run_ensemble_predictions(Model, Hist_X, Fore_X, num_members=4, noise_scale=1.0, fixed_noise = False):
+    """
+    Run model predictions with an additional row of random noise each time.
+    
+    Args:
+        Model: The model to generate predictions
+        Hist_X: Historical data tensor [batch_size, seq_len, features]
+        Fore_X: Forecast data tensor [batch_size, seq_len, features]
+        num_members: Number of ensemble members to generate
+        noise_scale: Scale of random noise to add
+        
+    Returns:
+        Tensor of ensemble predictions [num_members, batch_size, num_steps]
+    """
+    batch_size = Hist_X.shape[0]
+    hist_seq_len = Hist_X.shape[1]
+    hist_features = Hist_X.shape[2]
+    fore_seq_len = Fore_X.shape[1]
+    fore_features = Fore_X.shape[2]
+    device = Hist_X.device
+    
+    # List to store all predictions
+    all_predictions = []
+
+
+    for member_idx in range(num_members):
+        # Create noise rows for both historical and forecast data
+        with torch.no_grad():
+            hist_noise = noise_scale * torch.randn(batch_size, hist_seq_len, 1, device=device)
+            fore_noise = noise_scale * torch.randn(batch_size, fore_seq_len, 1, device=device)
+
+            
+            if fixed_noise == True:
+                # Generate single random noise value per batch item
+                batch_noise = noise_scale * torch.randn(batch_size, 1, 1, device=device)
+                
+                # Repeat this same noise value across the sequence length dimensions
+                hist_noise = batch_noise.repeat(1, hist_seq_len, 1)
+                fore_noise = batch_noise.repeat(1, fore_seq_len, 1)
+
+        # Concatenate noise as an additional feature
+        hist_with_noise = torch.cat([Hist_X, hist_noise], dim=2)
+        fore_with_noise = torch.cat([Fore_X, fore_noise], dim=2)
+        
+        # Run the model with the augmented input
+        prediction = Model(hist_with_noise, 
+                            fore_with_noise)[1]
+        
+        # Add this prediction to our collection
+        all_predictions.append(prediction)
+
+
+        del hist_with_noise, fore_with_noise
+    
+    # Stack all predictions to create a tensor with shape [num_members, batch_size, num_steps]
+    ensemble_predictions = torch.stack(all_predictions, dim=0)
+    
+    return ensemble_predictions
+
+
+def calculate_kge(observed, simulated):
+    """
+    Calculate Kling-Gupta Efficiency for timeseries data.
+    
+    Parameters:
+    -----------
+    observed : array-like
+        Observed timeseries values
+    simulated : array-like
+        Simulated timeseries values
+        
+    Returns:
+    --------
+    float
+        KGE value (range: -∞ to 1, where 1 is perfect)
+    """
+    # Ensure inputs are numpy arrays
+    observed = np.array(observed)
+    simulated = np.array(simulated)
+    
+    # Add small constant to avoid division by zero
+    eps = 1e-6
+    
+    # Calculate components
+    mean_obs = np.mean(observed)
+    mean_sim = np.mean(simulated)
+    std_obs = np.std(observed)
+    std_sim = np.std(simulated)
+    
+    # Correlation coefficient
+    r = np.corrcoef(observed, simulated)[0, 1]
+    
+    # Ratio of means (beta)
+    beta = mean_sim / (mean_obs + eps)
+    
+    # Ratio of standard deviations (alpha)
+    alpha = std_sim / (std_obs + eps)
+    
+    # Calculate KGE
+    kge = 1 - np.sqrt((r - 1)**2 + (beta - 1)**2 + (alpha - 1)**2)
+    
+    return kge
+
+
+def calculate_crps(x, y):
+    """
+    Computes CRPS from x using y as reference,
+    first x dimension must be ensembles, next dimensions can be arbitrary
+    x: ensemble data (n_ens, n_points)
+    y: observation/analysis data (n_points)
+    returns: crps (n_points)
+    REFERENCE
+      Hersbach, 2000: Decomposition of the Continuous Ranked Probability Score for Ensemble Prediction Systems.
+      Weather and Forecasting 15: 559-570.
+    """
+
+    # first sort ensemble
+    x.sort(axis=0)
+
+    # construct alpha and beta, size nens+1
+    n_ens = x.shape[0]
+    shape = (n_ens+1,)+x.shape[1:]
+    alpha = np.zeros(shape)
+    beta = np.zeros(shape)
+
+    # x[i+1]-x[i] and x[i]-y[i] arrays
+    diffxy = x-y.reshape(1, *(y.shape))
+    diffxx = x[1:]-x[:-1]  # x[i+1]-x[i], size ens-1
+
+    # if i == 0
+    alpha[0] = 0
+    beta[0] = np.fmax(diffxy[0], 0)  # x(0)-y
+    # if i == n_ens
+    alpha[-1] = np.fmax(-diffxy[-1], 0)  # y-x(n)
+    beta[-1] = 0
+    # else
+    alpha[1:-1] = np.fmin(diffxx, np.fmax(-diffxy[:-1], 0))  # x(i+1)-x(i) or y-x(i) or 0
+    beta[1:-1] = np.fmin(diffxx, np.fmax(diffxy[1:], 0))  # 0 or x(i+1)-y or x(i+1)-x(i)
+
+    # compute crps
+    p_exp = (np.arange(n_ens+1)/float(n_ens)).reshape(n_ens+1, *([1]*y.ndim))
+    crps = np.sum(alpha*(p_exp**2) + beta*((1-p_exp)**2), axis=0)
+    #
+    # p = np.arange(n_ens+1)/float(n_ens)
+    # alpha_mean = alpha.mean(axis=1)
+    # beat_mean = beta.mean(axis=1)
+    # crps = alpha_mean*(p**2) + beat_mean*((1-p)**2)
+    # crps_mean = crps2.sum()
+    #
+    # p_exp = np.expand_dims(np.arange(n_ens+1)/float(n_ens), axis=1)
+    # crps = np.nansum(alpha*(p_exp**2) + beta*((1-p_exp)**2), axis=0)
+    # crps_mean = crps.mean()
+    return crps
+
+
+def transform_CMAL_parameters(tensor):
+    """
+    Transform a tensor by applying:
+    - Softplus to the second element (index 1) of each row
+    - Sigmoid to the third element (index 2) of each row
+    
+    Args:
+        tensor: Input tensor of shape [batch_size, features]
+        
+    Returns:
+        Transformed tensor of the same shape
+    """
+    result = tensor.clone()
+    
+    # Apply softplus to the second column (index 1)
+    result[:, 1] = F.softplus(tensor[:, 1])
+    
+    # Apply sigmoid to the third column (index 2)
+    result[:, 2] = torch.sigmoid(tensor[:, 2])
+    
+    return result
+
+
+def transform_CMAL_parameters_multi(tensor):
+    '''
+    Generates predictions from a tensor representing multiple Asymetric Laplacians 
+    '''
+    # Input tensor of shape (b, m, 4n), batch, days, number of Asymmetric laplcians
+    b, m, n4 = tensor.shape
+    n = n4 // 4
+    
+    # Create a copy of the tensor to modify
+    result = tensor.clone()
+    
+    # Apply softplus to elements with index 1mod4 (positions 1, 5, 9, ...)
+    softplus_indices = torch.arange(1, n4, 4)
+    result[:, :, softplus_indices] = F.softplus(tensor[:, :, softplus_indices])
+    
+    # Apply sigmoid to elements with index 2mod4 (positions 2, 6, 10, ...)
+    sigmoid_indices = torch.arange(2, n4, 4)
+    result[:, :, sigmoid_indices] = torch.sigmoid(tensor[:, :, sigmoid_indices])
+    
+    # Apply softmax to every 4th element (indices 3mod4)
+    # First, reshape to extract these elements
+    softmax_indices = torch.arange(3, n4, 4)
+    
+    # Extract the elements to apply softmax to
+    softmax_elements = tensor[:, :, softmax_indices]
+    
+    # Apply softmax along dimension 1 (across the n elements)
+    softmax_result = F.softmax(softmax_elements, dim= -1)
+    
+    # Put the softmax result back in the original tensor
+    result[:, :, softmax_indices] = softmax_result
+    
+    return result
+
+
+def load_and_unnormalize(ensemble_predictions, true_discharge, scaler_path='/home/mokr/Loss_Functions_Paper/Scalers/discharge_caravan_scalers.joblib'):
+    """
+    Load scaler and normalize ensemble predictions and true discharge.
+    
+    Args:
+        ensemble_predictions (torch.Tensor): Ensemble predictions to normalize
+        true_discharge (torch.Tensor): True discharge values to normalize
+        scaler_path (str): Path to the joblib scaler file
+    
+    Returns:
+        tuple: Normalized ensemble predictions and true discharge
+    """
+    # Load the scaler
+    try:
+        scaler = joblib.load(scaler_path)['streamflow']
+    except FileNotFoundError:
+        print(f"Scaler file not found at {scaler_path}")
+        return ensemble_predictions, true_discharge
+    except Exception as e:
+        print(f"Error loading scaler: {e}")
+        return ensemble_predictions, true_discharge
+    
+    # Convert to numpy if tensor
+    if isinstance(ensemble_predictions, torch.Tensor):
+        ensemble_predictions = ensemble_predictions.numpy()
+    
+    if isinstance(true_discharge, torch.Tensor):
+        true_discharge = true_discharge.numpy()
+    
+    # Normalize ensemble predictions
+    # Assuming the scaler is a scipy.stats.StandardScaler
+    unnormalized_ensemble = (ensemble_predictions*scaler.scale_) + scaler.mean_ 
+    
+    # Normalize true discharge
+    unnormalized_true_discharge = (true_discharge*scaler.scale_) + scaler.mean_
+    
+    return unnormalized_ensemble, unnormalized_true_discharge
+
+
+def replace_keys(d, key_map):
+    """Replace keys in a dictionary according to key_map."""
+    return {key_map.get(k, k): v for k, v in d.items()}
+
 
 def print_cuda_memory_summary():
     stats = torch.cuda.memory_stats()
@@ -1480,3 +1139,7 @@ def print_cuda_memory_summary():
     for k, v in summary.items():
         print(f"  {k:<25}: {v}")
 
+
+sys.path.append(str(functions_path))
+
+warnings.filterwarnings('ignore', category=FutureWarning, message='Series.__getitem__ treating keys as positions is deprecated')

@@ -1,40 +1,42 @@
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+# Standard library imports
 import os
-import pandas as pd
-import itertools
 import pickle
-
 import sys
 from pathlib import Path
+from collections import defaultdict
+
+# Third-party imports
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+# PyTorch
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, Subset
+
+# Add custom modules path
 functions_path = Path("/home/mokr/Loss_Functions_Paper/ML_Functions/")
 sys.path.append(str(functions_path))
 
+# Custom module imports
 import ML_functions
-from ML_functions import HydroDataset
+from ML_functions import (HydroDataset, load_and_unnormalize, transform_CMAL_parameters_multi, run_ensemble_predictions)
+
 import ML_Losses
 
-import torch
-import torch.nn as nn
-from collections import defaultdict
-from torch.utils.data import Subset
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
+from ML_Plots import (CMAL_quantile, transform_CMAL_parameters, draw_from_CMAL_distribution, draw_from_CMAL_distribution_np, get_ensemble_members_vectorized, get_nonbinary_ensemble_members)
 
-from ML_Plots import kl_divergence, CMAL_quantile, transform_CMAL_parameters, draw_from_CMAL_distribution, draw_from_CMAL_distribution_np, load_and_unnormalize, get_ensemble_members_vectorized, plot_ensemble_predictions, generate_greedy_trajectories, plot_dispersion_histograms, plot_uniform_qq, load_and_unnormalize
+from ML_Processing import (process_ensemble_predictions_efficient, initialize_storage_efficient)
 
-from ML_Losses import compute_log_likelihood, compute_CDF, crps_loss, compute_crps, calculate_overall_crps, get_member_summaries_torch , compute_nse, compute_kge, process_ensemble_predictions, process_ensemble_predictions_efficient, initialize_storage_efficient
-
-from ML_functions import transform_CMAL_parameters_multi, run_ensemble_predictions
+from ML_Metrics import (calculate_nse, calculate_kge, compute_crps, compute_crps_np,
+    calculate_overall_crps, calculate_model_crps)
 
 
-
-
-
-CRPS_Binary_Model =  torch.load('/home/mokr/Loss_Functions_Paper/Models/Binary/hyperparameter_test/Binary_lr_0.001_bi_False_h_256_256_256_0506_30Epochs.pth', weights_only = False, map_location=torch.device('cpu')) # BEST CRPS Model
-CMAL_Binary_Model =  torch.load('/home/mokr/Loss_Functions_Paper/Models/Binary/hyperparameter_test/CMAL_Binary_lr_0.001_bi_False_h_256_256_256_0507_10Epochs.pth', weights_only = False, map_location=torch.device('cpu')) # BEST CMAL Modelm loss -15
-NonBinary_Model = torch.load('/home/mokr/Loss_Functions_Paper/Models/NonBinary/hyperparameter_test/NonBinary_lr_0.001_bi_False_h_128_128_64_0503_30Epochs.pth', weights_only = False, map_location=torch.device('cpu')) # Best NonBinary models so far
+Conditional_Model =  torch.load('/home/mokr/Loss_Functions_Paper/Models/Conditional/hyperparameter_test/Conditional_lr_0.001_bi_False_h_256_256_256_0506_30Epochs.pth', weights_only = False, map_location=torch.device('cpu')) # BEST CRPS Model
+CMAL_Conditional_Model =  torch.load('/home/mokr/Loss_Functions_Paper/Models/Conditional/hyperparameter_test/CMAL_Conditional_lr_0.001_bi_False_h_256_256_256_0507_10Epochs.pth', weights_only = False, map_location=torch.device('cpu')) # BEST CMAL Modelm loss -15
+Probabilistic_Model = torch.load('/home/mokr/Loss_Functions_Paper/Models/Probabilistic/hyperparameter_test/Probabilistic_lr_0.001_bi_False_h_128_128_64_0503_30Epochs.pth', weights_only = False, map_location=torch.device('cpu')) # Best Probabilistic models so far
 Fixed_Noise_Seeded_Model = torch.load('/home/mokr/Loss_Functions_Paper/Models/Seeded/hyperparameter_test/Seeded_lr_0.001_bi_False_h_256_256_128_0623_8_0.9_5_True_Epochs.pth', weights_only = False, map_location=torch.device('cpu')) # Best Seeded Model so far
 Non_Fixed_Noise_Seeded_Model = torch.load('/home/mokr/Loss_Functions_Paper/Models/Seeded/hyperparameter_test/Seeded_lr_0.001_bi_False_h_128_128_64_0526_8_0.85_5_False_Epochs.pth', weights_only = False, map_location=torch.device('cpu')) # 0.06 val loss
 
@@ -64,7 +66,7 @@ Validation_Dataloader = DataLoader(subset_data, batch_size=1, shuffle=False, pin
 
 variogram_p = 0.5
 
-def get_nonbinary_ensemble_members(model, Hist_X_Chunk_Torch, Fore_X_Chunk_Torch, num_members=1, keep_original = False, device='cpu'):
+def get_Probabilistic_ensemble_members(model, Hist_X_Chunk_Torch, Fore_X_Chunk_Torch, num_members=1, keep_original = False, device='cpu'):
     """
     Generate ensemble predictions for discharge.
     
@@ -137,47 +139,47 @@ for i, (Hist_X_Chunk_Torch, Fore_X_Chunk_Torch, Y_value, date_idx, basin_idx) in
     date_idx = date_idx[0] 
     
     if basin_idx not in basin_forecasts:
-        basin_forecasts[basin_idx] = {"CRPS": [], "Seeded": [], "NonBinary": [], "Discharge": []}
+        basin_forecasts[basin_idx] = {"Conditional": [], "Seeded": [], "Probabilistic": [], "Discharge": []}
             
     Fore_X_Chunk_Torch_Flagless = Fore_X_Chunk_Torch[:,:, 0:15]
     
     num_members = 11
     num_steps = Fore_X_Chunk_Torch.shape[1]
 
-    # Get the members of the CRPS, CMAL, and NonBinary models, unnormalise them and clip them to only predict positive discharge
-    CRPS_ensemble_predictions =  get_ensemble_members_vectorized(CRPS_Binary_Model, Hist_X_Chunk_Torch, Fore_X_Chunk_Torch[:,:,0:15], num_members= num_members, keep_original = False)
+    # Get the members of the CRPS, CMAL, and Probabilistic models, unnormalise them and clip them to only predict positive discharge
+    Conditional_ensemble_predictions =  get_ensemble_members_vectorized(Conditional_Model, Hist_X_Chunk_Torch, Fore_X_Chunk_Torch[:,:,0:15], num_members= num_members, keep_original = False)
     
-    NonBinary_ensemble_predictions = get_nonbinary_ensemble_members(NonBinary_Model, Hist_X_Chunk_Torch, Fore_X_Chunk_Torch[:,:,0:15], num_members= num_members, keep_original = False)
+    Probabilistic_ensemble_predictions = get_nonbinary_ensemble_members(Probabilistic_Model, Hist_X_Chunk_Torch, Fore_X_Chunk_Torch[:,:,0:15], num_members= num_members, keep_original = False)
 
     Fixed_Seeded_ensemble_predictions = run_ensemble_predictions(Fixed_Noise_Seeded_Model, Hist_X_Chunk_Torch.to(torch.float32), Fore_X_Chunk_Torch_Flagless.to(torch.float32), num_members=num_members, noise_scale=1.0)
     Non_Fixed_Seeded_ensemble_predictions = run_ensemble_predictions(Non_Fixed_Noise_Seeded_Model, Hist_X_Chunk_Torch.to(torch.float32), Fore_X_Chunk_Torch_Flagless.to(torch.float32), num_members=num_members, noise_scale=1.0)
     
-    CRPS_ensemble_predictions, NonBinary_ensemble_predictions = CRPS_ensemble_predictions.unsqueeze(1), NonBinary_ensemble_predictions.unsqueeze(1)
+    Conditional_ensemble_predictions, Probabilistic_ensemble_predictions = Conditional_ensemble_predictions.unsqueeze(1), Probabilistic_ensemble_predictions.unsqueeze(1)
     Fixed_Seeded_ensemble_predictions = Fixed_Seeded_ensemble_predictions.squeeze().unsqueeze(1)
     Non_Fixed_Seeded_ensemble_predictions = Non_Fixed_Seeded_ensemble_predictions.squeeze().unsqueeze(1)
 
     
-    CRPS_ensemble_predictions[CRPS_ensemble_predictions < -0.26787253] = -0.2678725
-    NonBinary_ensemble_predictions[NonBinary_ensemble_predictions < -0.26787253] = -0.2678725 
+    Conditional_ensemble_predictions[Conditional_ensemble_predictions < -0.26787253] = -0.2678725
+    Probabilistic_ensemble_predictions[Probabilistic_ensemble_predictions < -0.26787253] = -0.2678725 
     Fixed_Seeded_ensemble_predictions[Fixed_Seeded_ensemble_predictions < -0.26787253] = -0.2678725
     Non_Fixed_Seeded_ensemble_predictions[Non_Fixed_Seeded_ensemble_predictions < -0.26787253] = -0.2678725
     
-    CRPS_ensemble_predictions, true_discharge = load_and_unnormalize(CRPS_ensemble_predictions, Y_value, scaler_path)
-    NonBinary_ensemble_predictions, _ = load_and_unnormalize(NonBinary_ensemble_predictions, Y_value, scaler_path)
+    Conditional_ensemble_predictions, true_discharge = load_and_unnormalize(Conditional_ensemble_predictions, Y_value, scaler_path)
+    Probabilistic_ensemble_predictions, _ = load_and_unnormalize(Probabilistic_ensemble_predictions, Y_value, scaler_path)
     Fixed_Seeded_ensemble_predictions, _ = load_and_unnormalize(Fixed_Seeded_ensemble_predictions.detach(), Y_value)   
     Non_Fixed_Seeded_ensemble_predictions, _ = load_and_unnormalize(Non_Fixed_Seeded_ensemble_predictions.detach(), Y_value)
 
     true_discharge[true_discharge < 0] = 0
-    CRPS_ensemble_predictions[CRPS_ensemble_predictions < 0] = 0
-    NonBinary_ensemble_predictions[NonBinary_ensemble_predictions < 0] = 0 
+    Conditional_ensemble_predictions[Conditional_ensemble_predictions < 0] = 0
+    Probabilistic_ensemble_predictions[Probabilistic_ensemble_predictions < 0] = 0 
     Fixed_Seeded_ensemble_predictions[Fixed_Seeded_ensemble_predictions < 0] = 0
     Non_Fixed_Seeded_ensemble_predictions[Non_Fixed_Seeded_ensemble_predictions < 0] = 0
        
     
     # Convert everything to torch
-    CRPS_ensemble_predictions, Fixed_Seeded_ensemble_predictions, Non_Fixed_Seeded_ensemble_predictions, NonBinary_ensemble_predictions, true_discharge = map(
+    Conditional_ensemble_predictions, Fixed_Seeded_ensemble_predictions, Non_Fixed_Seeded_ensemble_predictions, Probabilistic_ensemble_predictions, true_discharge = map(
         lambda x: torch.from_numpy(x).float(),
-        [CRPS_ensemble_predictions, Fixed_Seeded_ensemble_predictions, Non_Fixed_Seeded_ensemble_predictions, NonBinary_ensemble_predictions, true_discharge]
+        [Conditional_ensemble_predictions, Fixed_Seeded_ensemble_predictions, Non_Fixed_Seeded_ensemble_predictions, Probabilistic_ensemble_predictions, true_discharge]
     )
      
 
@@ -187,10 +189,10 @@ for i, (Hist_X_Chunk_Torch, Fore_X_Chunk_Torch, Y_value, date_idx, basin_idx) in
     # CRPS
 
     model_preds = {
-    "CRPS": CRPS_ensemble_predictions,
+    "Conditional": Conditional_ensemble_predictions,
     "Fixed_Seeded": Fixed_Seeded_ensemble_predictions,
     "Non_Fixed_Seeded": Non_Fixed_Seeded_ensemble_predictions,
-    "NonBinary": NonBinary_ensemble_predictions
+    "Probabilistic": Probabilistic_ensemble_predictions
     }
 
     # process_ensemble_predictions(model_preds, true_discharge, basin_idx,

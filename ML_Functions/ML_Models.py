@@ -1,121 +1,49 @@
+"""
+FILE CONTENTS
+================================================================================
+
+CLASSES:
+--------------------------------------------------------------------------------
+ 1. LSTMModel
+    No description available
+    Methods: __init__, forward
+
+ 2. Hindcast_LSTM_Block
+    No description available
+    Methods: __init__, forward
+ 3. Forecast_LSTM_Block
+    No description available
+    Methods: __init__, forward
+ 4. Google_LSTMModel
+    No description available
+    Methods: __init__, forward
+ 5. NN
+    No description available
+    Methods: __init__, forward
+ 6. EarlyStopper
+    No description available
+    Methods: __init__, early_stop
+
+FUNCTIONS:
+--------------------------------------------------------------------------------
+ 1. Google_Model_Block
+    No description available
+3. define_models
+    No description available
+================================================================================
+"""
+
 import random
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.cuda.amp import autocast, GradScaler
-
-
 from collections import defaultdict
-
-
 import sys
-sys.path.append('/data/Hydra_Work/Competition_Functions') 
-from Processing_Functions import process_forecast_date, process_seasonal_forecasts, fit_fourier_to_h0, Get_History_Statistics
 
-
-class Hindcast_LSTM_Block(nn.Module):
-    # This block serves to take in historic data and output the initial memory and hidden 
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout = 0.0, bidirectional = False):
-        super(Hindcast_LSTM_Block, self).__init__()
-        self.bidirectional = bidirectional  # Store bidirectional as an instance variable
-        self.No_Directions = 1 if not bidirectional else 2
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-
-
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout= dropout, bidirectional = bidirectional)
-        self.dropout = nn.Dropout(p=dropout)
-        self.fc = nn.Linear(hidden_size * self.No_Directions, output_size) # If bidirectional is true need the *2
-
-    def forward(self, x):
-        # Map H0_sequences and H0_static to the appropriate sizes
-        # Is this implementation of history doing anything
-        
-        # h0 = torch.zeros(self.num_layers * self.No_Directions, self.hidden_size).to(x.device)
-        # c0 = torch.zeros(self.num_layers * self.No_Directions, self.hidden_size).to(x.device)
-
-        if len(np.shape(x)) == 3:
-            h0 = torch.zeros( self.num_layers * self.No_Directions, x.size(0), self.hidden_size).to(x.device)
-            c0 = torch.zeros( self.num_layers * self.No_Directions, x.size(0), self.hidden_size).to(x.device)
-        else:
-            h0 = torch.zeros( self.num_layers * self.No_Directions, self.hidden_size).to(x.device)
-            c0 = torch.zeros(self.num_layers * self.No_Directions, self.hidden_size).to(x.device)
-            
-        out, (hn, cn) = self.lstm(x, (h0, c0)) 
-        out = self.dropout(out)
-        out = self.fc(out)  # Take the output from the last time step
-        return out, hn, cn
-
-class Forecast_LSTM_Block(nn.Module):
-    # This block serves to take in historic data and output the initial memory and hidden 
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout = 0.0, bidirectional = False):
-        super(Forecast_LSTM_Block, self).__init__()
-        self.bidirectional = bidirectional  # Store bidirectional as an instance variable
-        self.No_Directions = 1 if not bidirectional else 2
-
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-
-
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout= dropout, bidirectional = bidirectional)
-        self.dropout = nn.Dropout(p=dropout)
-        self.fc = nn.Linear(hidden_size * self.No_Directions, output_size) # If bidirectional is true need the *2
-
-    def forward(self, x, h0, c0):
-        # Map H0_sequences and H0_static to the appropriate sizes
-        # Is this implementation of history doing anything
-   
-        out, _ = self.lstm(x, (h0, c0)) 
-        out = self.dropout(out)
-        out = self.fc(out)  # Take the output from the last time step
-        return out
-    
-class Google_LSTMModel(nn.Module):
-  def __init__(self, hindcast):
-    super(Google_LSTMModel, self).__init__()
-    self.hindcast = hindcast
-    # self.forecast = forecast
-    
-  def forward(self, history):
-    
-    # get states from hindcast model
-    # need to decide whether the head recieves the raw history or an encoding of it
-    hind_out, hn,cn = self.hindcast(history)
-    
-    # get forecasts from forecast model
-    #out = self.forecast(forecasts, hn,cn)
-    return hind_out #, hind_out
-
-def Google_Model_Block(hindcast_input_size, forecast_input_size, hindcast_output_size, forecast_output_size, hidden_size, num_layers, device, dropout = 0.0, bidirectional = False):
-    # For now dropout and bidirectional aren't included here, can change that down the line
-    # output_size for Hindcast doesn't actually matter
-    Hindcast = Hindcast_LSTM_Block(hindcast_input_size, hidden_size, num_layers, hindcast_output_size, dropout = dropout, bidirectional = bidirectional)
-    #Forecast = Forecast_LSTM_Block(forecast_input_size, hidden_size, num_layers, forecast_output_size, dropout = dropout, bidirectional = bidirectional)
-    Block = Google_LSTMModel(Hindcast)
-    Block.to(device)
-
-    return Block
-
-
-def Specific_Heads(basins, hindcast_input_size, forecast_input_size, hindcast_output_size, forecast_output_size, hidden_size, num_layers, device, dropout = 0.0, bidirectional = False):
-    model_heads = {}
-    for basin in basins:
-        basin_hindcast = Hindcast_LSTM_Block(hindcast_input_size, hidden_size, num_layers, hindcast_output_size, dropout = dropout, bidirectional = bidirectional)
-        #basin_forecast = Forecast_LSTM_Block(forecast_input_size, hidden_size, num_layers, forecast_output_size, dropout = dropout, bidirectional = bidirectional)
-    
-        model_heads[f'{basin}'] = Google_LSTMModel(basin_hindcast)
-        model_heads[f'{basin}'].to(device)
-    return model_heads
-
-
-
-    
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size, dropout = 0.0, bidirectional = False, Sequence_Target = False):
         self.bidirectional = bidirectional  # Store bidirectional as an instance variable
@@ -142,65 +70,116 @@ class LSTMModel(nn.Module):
         out = self.fc(out) 
         return out
 
-class SumPinballLoss(nn.Module):
-    def __init__(self, quantiles = [0.1,0.5,0.9]):
-        super(SumPinballLoss, self).__init__()
-        self.quantiles = quantiles
 
-    def forward(self, observed, modeled):
-        # Initialize a list to store losses for each output
-        output_losses = []
-        observed = observed.squeeze()
-        # modeled = torch.sum(modeled, dim = 1)
+class Hindcast_LSTM_Block(nn.Module):
+    # This block serves to take in historic data and output the initial memory and hidden 
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout = 0.0, bidirectional = False, eval_dropout = True):
+        super(Hindcast_LSTM_Block, self).__init__()
+        self.bidirectional = bidirectional  # Store bidirectional as an instance variable
+        self.No_Directions = 1 if not bidirectional else 2
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
 
- 
-        # Calculate the quantile loss for each output and quantile
-        for i, quantile in enumerate(self.quantiles):
-            modeled_quantile = modeled[...,i]
-            errors = torch.max(quantile * (observed - modeled_quantile), (quantile - 1) * (observed - modeled_quantile))
-            loss = torch.mean(errors)
+        self.dropout = dropout
+        self.eval_dropout = eval_dropout
         
-            output_losses.append(loss)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout= dropout, bidirectional = bidirectional)
+        # self.dropout = nn.Dropout(p=dropout)
+        self.fc = nn.Linear(hidden_size * self.No_Directions, output_size) # If bidirectional is true need the *2
 
-        # Sum the losses for each output and quantile
-        overall_loss = sum(output_losses) 
+    def forward(self, x):
+        # Map H0_sequences and H0_static to the appropriate sizes
+        # Is this implementation of history doing anything
         
-        return overall_loss
-    
-class ChangingPinballLoss(nn.Module): # 4 differnt trials to run to show the effect of loss function to seasnoal flow prediction when using LSTMs/Transformers
-    def __init__(self, quantiles = [0.1,0.5,0.9]):
-        super(SumPinballLoss, self).__init__()
-        self.quantiles = quantiles
+        # h0 = torch.zeros(self.num_layers * self.No_Directions, self.hidden_size).to(x.device)
+        # c0 = torch.zeros(self.num_layers * self.No_Directions, self.hidden_size).to(x.device)
 
-    def forward(self, observed, modeled, multiplier, constant = 1):
-        # Initialize a list to store losses for each output
-        output_losses = []
-        observed = observed.squeeze()
-
-        #modeled = torch.sum(modeled, dim = 1)
- 
-        # Calculate the quantile loss for each output and quantile
-        for i, quantile in enumerate(self.quantiles):
-
-            modeled_quantile = modeled[...,i]
-            loss = torch.nanmean(torch.max(quantile * torch.nansum(observed - modeled_quantile), (quantile - 1) * torch.nansum(observed - modeled_quantile) ))
-
-            length = loss.size(0)
-            if multiplier == 'Linear':
-                multipliers = torch.arange(length) * constant
-            elif multiplier == 'exponential':
-                multipliers = torch.exp(torch.arange(length) * constant)
-            elif multiplier == "quadratic":
-                multipliers = torch.clamp(constant[1]*(torch.arange(length) - constant[0]) ** 2, min=0)
-
-        
-            loss = loss*multipliers
-            output_losses.append(loss)
+        if len(np.shape(x)) == 3:
+            h0 = torch.zeros( self.num_layers * self.No_Directions, x.size(0), self.hidden_size).to(x.device)
+            c0 = torch.zeros( self.num_layers * self.No_Directions, x.size(0), self.hidden_size).to(x.device)
+        else:
+            h0 = torch.zeros( self.num_layers * self.No_Directions, self.hidden_size).to(x.device)
+            c0 = torch.zeros(self.num_layers * self.No_Directions, self.hidden_size).to(x.device)
             
-        # Sum the losses for each output and quantile
-        overall_loss = sum(output_losses)
+        out, (hn, cn) = self.lstm(x, (h0.contiguous(), c0.contiguous())) 
+        # out = self.dropout(out)
+        out = F.dropout(out, p= self.dropout, training= self.eval_dropout)
+        out = self.fc(out)  # Take the output from the last time step
+        return out, hn, cn
+
+
+class Forecast_LSTM_Block(nn.Module):
+    # This block serves to take in historic data and output the initial memory and hidden 
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout = 0.0, bidirectional = False, eval_dropout = True):
+        super(Forecast_LSTM_Block, self).__init__()
+        self.bidirectional = bidirectional  # Store bidirectional as an instance variable
+        self.No_Directions = 1 if not bidirectional else 2
+
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        self.dropout = dropout
+        self.eval_dropout = eval_dropout
+
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout= dropout, bidirectional = bidirectional)
+        # self.dropout = nn.Dropout(p=dropout)
+        self.fc = nn.Linear(hidden_size * self.No_Directions, output_size) # If bidirectional is true need the *2
+
+    def forward(self, x, h0, c0):
+        # Map H0_sequences and H0_static to the appropriate sizes
+        # Is this implementation of history doing anything
+   
+        out, _ = self.lstm(x, (h0.contiguous(), c0.contiguous())) 
+        # out = self.dropout(out)
+        out = F.dropout(out, p= self.dropout, training= self.eval_dropout)
+        out = self.fc(out)  # Take the output from the last time step
+        return out
+
+
+class NN(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(NN, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, output_size)
+        self.output_size = output_size  # Store output_size for slicing
+
+
+    def forward(self, x):
+        # x has shape [num_layers, batch_size, input_size]
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.fc2(x)
+
+        # Split along the last dimension
+        split_size = self.output_size // 2  # Ensure even split
+        hn_new, cn_new = x[..., :split_size], x[..., split_size:]
+
+        return hn_new, cn_new
         
-        return overall_loss
+class Google_LSTMModel(nn.Module):
+  def __init__(self, hindcast, forecast, handover):
+    super(Google_LSTMModel, self).__init__()
+    self.hindcast = hindcast
+    self.forecast = forecast
+    self.handover = handover
+      
+  def forward(self, history, forecasts):
+    
+    # get states from hindcast model
+    # need to decide whether the head recieves the raw history or an encoding of it
+    hind_out, hn,cn = self.hindcast(history)
+    # add a neural network to convert one states fro history to an initialisation for forecasts
+    hn_new, cn_new = self.handover(torch.cat((hn, cn), dim=-1))
+    # get forecasts from forecast model
+
+    # Ensure contiguity and correct shape for LSTM input
+    hn_new = hn_new.contiguous()
+    cn_new = cn_new.contiguous()
+      
+    out = self.forecast(forecasts, hn_new,cn_new)
+    return hind_out , out
 
 class EarlyStopper:
     def __init__(self, patience=1, min_delta=0):
@@ -220,7 +199,19 @@ class EarlyStopper:
         return False
 
 
-# Do we want hindcast and forecast num-layers to be different?
+
+def Google_Model_Block(hindcast_input_size, forecast_input_size, hindcast_output_size, forecast_output_size, hindcast_hidden_size, forecast_hidden_size, handoff_hidden_size, num_layers, device, dropout = 0.0, bidirectional = False, eval_dropout = False):
+    Hindcast = Hindcast_LSTM_Block(hindcast_input_size, hindcast_hidden_size, num_layers, hindcast_output_size, dropout = dropout, bidirectional = bidirectional, eval_dropout = eval_dropout)
+    Forecast = Forecast_LSTM_Block(forecast_input_size, forecast_hidden_size, num_layers, forecast_output_size, dropout = dropout, bidirectional = bidirectional, eval_dropout = eval_dropout)
+
+    size_multiplier = 2
+
+    Handover = NN(input_size= hindcast_hidden_size*2, hidden_size= handoff_hidden_size, output_size = forecast_hidden_size*size_multiplier)
+    Block = Google_LSTMModel(Hindcast, Forecast, Handover)
+    Block.to(device)
+
+    return Block
+
 def define_models(hindcast_input_size, forecast_input_size, hidden_size, num_layers, dropout, bidirectional, learning_rate, copies = 3, forecast_output_size = 3, device = 'cpu'):
     models = {}
     params_to_optimize = {}
@@ -241,7 +232,5 @@ def define_models(hindcast_input_size, forecast_input_size, hidden_size, num_lay
 
     return models, params_to_optimize, optimizers, schedulers
 
-# Model Running Code
-# Key difference here is that we won't need to restrict the history length to 90, it can be variable
 
 

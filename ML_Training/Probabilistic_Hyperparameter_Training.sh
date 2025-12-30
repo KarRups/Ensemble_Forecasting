@@ -8,9 +8,9 @@
 #SBATCH --mem=64G
 #SBATCH --time=10:30:00
 #SBATCH --job-name=Hyperparameter_Training
-#SBATCH --output=/home/mokr/Loss_Functions_Paper/ML_Training/Output_Files/GPU_Training_CRPS.out
-#SBATCH --error=/home/mokr/Loss_Functions_Paper/ML_Training/Output_Files/GPU_Training_error_CRPS.out
+#SBATCH --output=/home/mokr/Loss_Functions_Paper/ML_Training/Output_Files/Conditional_Hyperparameter_Training.out
+#SBATCH --error=/home/mokr/Loss_Functions_Paper/ML_Training/Output_Files/Conditional_Hyperparameter_Training_error.out
 
 module load python3
-# python3 /home/mokr/Loss_Functions_Paper/ML_Training/Conditional_GPU_Training.py
+
 python3 /home/mokr/Loss_Functions_Paper/ML_Training/Conditional_Hyperparameter_Training.py

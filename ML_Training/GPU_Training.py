@@ -27,6 +27,7 @@ functions_path = Path("/home/mokr/Loss_Functions_Paper/ML_Functions/")
 sys.path.append(str(functions_path))
 
 import ML_functions
+import ML_Models
 import ML_Losses
 from ML_functions import HydroDataset
 
@@ -115,7 +116,7 @@ def main():
     hindcast_hidden_size = 32
     forecast_hidden_size = 16
     handoff_hidden_size = 24
-    G_Model = ML_functions.Google_Model_Block(25, 15, 8, 12, hindcast_hidden_size, forecast_hidden_size,  handoff_hidden_size, 1, device)
+    G_Model = ML_Models.Google_Model_Block(25, 15, 8, 12, hindcast_hidden_size, forecast_hidden_size,  handoff_hidden_size, 1, device)
     optimizer = optim.Adam(G_Model.parameters(), lr=1e-4)
     criterion = ML_Losses.CRPSLoss()
     
