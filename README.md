@@ -45,22 +45,84 @@ pip install -r requirements.txt
 
 ```
 Ensemble_Forecasting/
-├── ML_Functions/          # Core model implementations
-│   ├── ML_functions.py    # Data loading and preprocessing
-│   ├── ML_Models.py       # LSTM architectures (Conditional, Seeded)
-│   ├── ML_Losses.py       # Custom loss functions
-│   ├── ML_Processing.py   # Post-processing utilities
-│   └── ML_Plots.py        # Visualization tools
-├── ML_Training/           # Training scripts and configurations
-│   ├── GPU_Training.py    # Main training script
-│   ├── Making_Dataloaders.py  # Dataset preparation
-│   └── Evaluation_Results.py  # Model evaluation
-├── Catchment_Averaging/   # Basin selection and preprocessing
-│   ├── Training_Models.ipynb
-│   └── ML_basin_splits.pkl    # Train/val/test splits
-├── notebooks/             # Analysis notebooks
-│   ├── Analysing_Models.ipynb
-│   └── Choosing_Catchment_Sample.ipynb
+│
+├── ML_Functions/                      # Core Python modules
+│   ├── ML_functions.py               # Main utility functions, data generators, model blocks
+│   ├── ML_Losses.py                  # Custom loss functions (CRPS, CMAL, KGE, etc.)
+│   ├── ML_Metrics.py                 # Evaluation metrics
+│   ├── ML_Models.py                  # Neural network architectures (LSTM, Hindcast/Forecast)
+│   ├── ML_Plots.py                   # Visualization functions
+│   └── ML_Processing.py              # Data processing and preparation utilities
+│
+├── ML_Training/                       # Training scripts and configuration
+│   ├── GPU_Training.py               # Main GPU training script
+│   ├── Conditional_GPU_Training.py   # Conditional model training
+│   ├── Seeded_Training.py            # Ensemble training with seeded models
+│   ├── Seeded_Training.sh            # Seeded training launcher
+│   ├── Probabilistic_Hyperparameter_Training.py
+│   ├── Probabilistic_Hyperparameter_Training.sh
+│   ├── Conditional_Hyperparameter_Training.py
+│   ├── Making_Dataloaders.py         # DataLoader creation
+│   ├── Making_Datasets.sh            # Dataset preparation script
+│   ├── Evaluation_Results.py         # Results evaluation
+│   ├── ML_Training_GPU.sh            # GPU training launcher
+│   └── ML_Training.sh                # General training launcher
+│
+├── Models/                            # Trained model checkpoints
+│   ├── Conditional/
+│   │   └── hyperparameter_test/      # Conditional model experiments
+│   ├── Probabilistic/
+│   │   └── hyperparameter_test/      # Probabilistic model experiments
+│   └── Seeded/
+│       └── hyperparameter_test/      # Ensemble model experiments
+│
+├── Notebooks/                         # Jupyter notebooks for analysis
+│   ├── Analysing_Results.ipynb       # Results analysis and visualization
+│   ├── Running_Models.ipynb          # Model inference and evaluation
+│   ├── Training_Models.ipynb         # Interactive model training
+│   ├── Choosing_Catchment_Sample.ipynb  # Basin selection
+│   └── Streamflow_In_Catchments.ipynb   # Data exploration
+│
+├── ML_basin_splits.pkl                # Train/validation/test basin splits
+├── ML_basin_splits.txt                # Human-readable basin splits
+├── Caravans_2016_2019_Basins.txt      # List of available basins
+├── Basin_Atlas_Shapefiles.zip         # Geographic data for catchments
+└── function_analysis_report.txt       # Code analysis report
+
+Note: Some directories are excluded from this view:
+- forecast_results/: Model prediction outputs
+- Koppen_Geiger/: Climate classification data
+- Scaled/: Scaled discharge and static catchment attributes
+```
+
+## Key Components
+
+### Core Modules (`ML_Functions/`)
+- **ML_functions.py**: Data generators, model building blocks, training loops
+- **ML_Losses.py**: Custom loss functions including CRPS, CMAL, and KGE losses
+- **ML_Models.py**: LSTM-based architectures for hydrological forecasting
+- **ML_Processing.py**: Data loading and preprocessing utilities
+- **ML_Metrics.py**: Performance evaluation metrics
+- **ML_Plots.py**: Visualization and plotting functions
+
+### Training Pipeline (`ML_Training/`)
+Contains scripts for:
+- Hyperparameter optimization
+- Multi-GPU training
+- Ensemble model training (seeded models)
+- Conditional and probabilistic forecasting
+- Dataset preparation and dataloader creation
+
+### Model Storage (`Models/`)
+Organized by model type:
+- **Conditional**: Conditional discharge forecasting models
+- **Probabilistic**: Probabilistic ensemble models
+- **Seeded**: Deterministic ensemble models with different random seeds
+
+### Data Management
+- **Scalers/**: Fitted normalization transformers for input features and targets
+- **Scaled/**: Pre-normalized datasets for faster loading
+- **Basin splits**: Pre-defined train/validation/test catchment divisions
 └── README.md
 ```
 
